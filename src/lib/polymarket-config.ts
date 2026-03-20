@@ -2,6 +2,8 @@
  * Polymarket 配置和环境检测
  */
 
+import { isConfigured as hasStoredCredentials } from './config-store';
+
 // API 端点配置
 export const POLYMARKET_CONFIG = {
   // CLOB API 基础URL
@@ -78,7 +80,31 @@ let cachedMode: RunMode | null = null;
 let lastModeCheck = 0;
 const MODE_CACHE_TTL = 60000; // 1分钟缓存
 
+// 强制模式（用户手动设置）
+let forcedMode: RunMode | null = null;
+
+/**
+ * 强制设置运行模式
+ */
+export function setForcedMode(mode: RunMode | null): void {
+  forcedMode = mode;
+  cachedMode = null;
+  lastModeCheck = 0;
+}
+
+/**
+ * 获取强制模式
+ */
+export function getForcedMode(): RunMode | null {
+  return forcedMode;
+}
+
 export async function getRunMode(): Promise<RunMode> {
+  // 如果用户强制设置了模式，优先使用
+  if (forcedMode) {
+    return forcedMode;
+  }
+  
   const now = Date.now();
   
   // 使用缓存
@@ -89,14 +115,20 @@ export async function getRunMode(): Promise<RunMode> {
   // 检测 API 连接
   const { reachable } = await checkApiConnectivity();
   
-  // 如果配置了凭证且 API 可达，使用生产模式
-  const hasCredentials = Boolean(
+  // 检查凭证（环境变量或存储的凭证）
+  const hasEnvCredentials = Boolean(
     process.env.WALLET_PRIVATE_KEY &&
     process.env.POLYMARKET_API_KEY &&
     process.env.POLYMARKET_API_SECRET
   );
   
-  cachedMode = (reachable && hasCredentials) ? 'production' : 'simulation';
+  const hasStoredConfig = hasStoredCredentials();
+  const hasCredentials = hasEnvCredentials || hasStoredConfig;
+  
+  // 如果配置了凭证，使用生产模式
+  // 注意：即使 API 不可达（可能是网络限制），只要配置了凭证就认为是生产模式
+  // 真实环境中部署后，API 调用会正常工作
+  cachedMode = hasCredentials ? 'production' : 'simulation';
   lastModeCheck = now;
   
   return cachedMode;
@@ -114,11 +146,13 @@ export function resetModeCache(): void {
  * 检查是否配置了交易凭证
  */
 export function hasTradingCredentials(): boolean {
-  return Boolean(
+  const hasEnvCredentials = Boolean(
     process.env.WALLET_PRIVATE_KEY &&
     process.env.POLYMARKET_API_KEY &&
     process.env.POLYMARKET_API_SECRET
   );
+  
+  return hasEnvCredentials || hasStoredCredentials();
 }
 
 /**
@@ -134,10 +168,13 @@ export function getConfigStatus(): {
   const hasApiKey = Boolean(process.env.POLYMARKET_API_KEY);
   const hasApiSecret = Boolean(process.env.POLYMARKET_API_SECRET);
   
+  const hasEnvConfig = hasPrivateKey && hasApiKey && hasApiSecret;
+  const hasStoredConfig = hasStoredCredentials();
+  
   return {
     hasPrivateKey,
     hasApiKey,
     hasApiSecret,
-    isConfigured: hasPrivateKey && hasApiKey && hasApiSecret,
+    isConfigured: hasEnvConfig || hasStoredConfig,
   };
 }

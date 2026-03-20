@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
-import { getInitializedCLOBClient } from '@/lib/polymarket-clob';
-import { getRunMode, checkApiConnectivity, getConfigStatus } from '@/lib/polymarket-config';
+import { getInitializedCLOBClient, resetCLOBClient } from '@/lib/polymarket-clob';
+import { getRunMode, checkApiConnectivity, getConfigStatus, resetModeCache } from '@/lib/polymarket-config';
 
 /**
  * 获取系统状态 API
@@ -8,6 +8,10 @@ import { getRunMode, checkApiConnectivity, getConfigStatus } from '@/lib/polymar
  */
 export async function GET() {
   try {
+    // 重置缓存以获取最新状态
+    resetModeCache();
+    resetCLOBClient();
+    
     const mode = await getRunMode();
     const configStatus = getConfigStatus();
     

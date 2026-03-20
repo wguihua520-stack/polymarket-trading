@@ -1,6 +1,7 @@
 import { Wallet } from 'ethers';
 import crypto from 'crypto';
 import { POLYMARKET_CONFIG, RunMode, getRunMode } from './polymarket-config';
+import { getCredentials } from './config-store';
 
 /**
  * 订单参数
@@ -582,11 +583,21 @@ export class PolymarketCLOBClient {
 // 单例
 let clobClient: PolymarketCLOBClient | null = null;
 
+/**
+ * 重置 CLOB 客户端（配置更改后调用）
+ */
+export function resetCLOBClient(): void {
+  clobClient = null;
+}
+
 export function getCLOBClient(): PolymarketCLOBClient {
   if (!clobClient) {
-    const privateKey = process.env.WALLET_PRIVATE_KEY;
-    const apiKey = process.env.POLYMARKET_API_KEY || '';
-    const apiSecret = process.env.POLYMARKET_API_SECRET || '';
+    // 优先使用存储的凭证，其次使用环境变量
+    const storedCreds = getCredentials();
+    
+    const privateKey = storedCreds?.walletPrivateKey || process.env.WALLET_PRIVATE_KEY;
+    const apiKey = storedCreds?.polymarketApiKey || process.env.POLYMARKET_API_KEY || '';
+    const apiSecret = storedCreds?.polymarketApiSecret || process.env.POLYMARKET_API_SECRET || '';
 
     clobClient = new PolymarketCLOBClient(privateKey, apiKey, apiSecret);
   }

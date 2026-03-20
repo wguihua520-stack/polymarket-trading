@@ -6,6 +6,8 @@ import {
   validateCredentials,
   type TradingCredentials,
 } from '@/lib/config-store';
+import { resetModeCache, setForcedMode } from '@/lib/polymarket-config';
+import { resetCLOBClient } from '@/lib/polymarket-clob';
 
 /**
  * 获取凭证状态
@@ -53,10 +55,16 @@ export async function POST(request: Request) {
     };
 
     saveCredentials(credentials);
+    
+    // 重置缓存，让系统重新检测模式
+    resetModeCache();
+    resetCLOBClient();
+    // 设置为生产模式
+    setForcedMode('production');
 
     return NextResponse.json({
       success: true,
-      message: '凭证已保存',
+      message: '凭证已保存，已切换到生产模式',
     });
   } catch (error) {
     console.error('Save credentials error:', error);
@@ -73,6 +81,11 @@ export async function POST(request: Request) {
  */
 export async function DELETE() {
   clearCredentials();
+  
+  // 重置缓存，切换回模拟模式
+  resetModeCache();
+  resetCLOBClient();
+  setForcedMode(null);
   
   return NextResponse.json({
     success: true,
