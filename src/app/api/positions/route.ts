@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getCLOBClient } from '@/lib/polymarket-clob';
+import { getInitializedCLOBClient } from '@/lib/polymarket-clob';
 
 /**
  * 获取持仓 API
@@ -7,23 +7,16 @@ import { getCLOBClient } from '@/lib/polymarket-clob';
  */
 export async function GET() {
   try {
-    const client = getCLOBClient();
-    
-    if (!client) {
-      return NextResponse.json({
-        success: false,
-        error: '交易客户端未配置',
-        data: { positions: [] },
-      });
-    }
-
+    const client = await getInitializedCLOBClient();
     const positions = await client.getPositions();
+    const mode = client.getMode();
 
     return NextResponse.json({
       success: true,
       data: {
         positions: positions || [],
         address: client.getAddress(),
+        mode,
       },
     });
   } catch (error) {

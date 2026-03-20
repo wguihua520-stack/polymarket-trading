@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getCLOBClient } from '@/lib/polymarket-clob';
+import { getInitializedCLOBClient } from '@/lib/polymarket-clob';
 
 /**
  * 创建订单 API
@@ -7,14 +7,8 @@ import { getCLOBClient } from '@/lib/polymarket-clob';
  */
 export async function POST(request: Request) {
   try {
-    const client = getCLOBClient();
-    
-    if (!client) {
-      return NextResponse.json({
-        success: false,
-        error: '交易客户端未配置，请检查 API Key 和私钥',
-      }, { status: 400 });
-    }
+    const client = await getInitializedCLOBClient();
+    const mode = client.getMode();
 
     const body = await request.json();
     const { tokenId, side, price, size } = body;
@@ -54,13 +48,17 @@ export async function POST(request: Request) {
         success: true,
         data: {
           orderId: result.orderId,
-          message: '订单创建成功',
+          message: mode === 'simulation' 
+            ? '模拟订单创建成功' 
+            : '订单创建成功',
         },
+        mode,
       });
     } else {
       return NextResponse.json({
         success: false,
         error: result.error || '订单创建失败',
+        mode,
       }, { status: 500 });
     }
   } catch (error) {
