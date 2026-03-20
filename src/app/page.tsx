@@ -1,248 +1,356 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
-import { ScrollArea } from '@/components/ui/scroll-area';
-import type { SystemState, TradingRound, LogEntry } from '@/types/trading';
-import { SystemStatusCard } from '@/components/dashboard/system-status-card';
-import { RoundInfoCard } from '@/components/dashboard/round-info-card';
-import { LogPanel } from '@/components/dashboard/log-panel';
-import { ConfigPanel } from '@/components/dashboard/config-panel';
-import { MarketsPanel } from '@/components/dashboard/markets-panel';
-import { Play, Square, Settings, TrendingUp, Activity } from 'lucide-react';
+import { useState, useEffect, useCallback } from 'react';
 
-export default function Dashboard() {
-  const [isRunning, setIsRunning] = useState(false);
-  const [systemState, setSystemState] = useState<SystemState | null>(null);
-  const [currentRound, setCurrentRound] = useState<TradingRound | null>(null);
+interface CycleData {
+  cycleId: string;
+  remainingSeconds: number;
+  progress: number;
+}
+
+interface Position {
+  asset: string;
+  side: string;
+  size: number;
+  avgPrice: number;
+  currentPrice: number;
+  pnl: number;
+}
+
+interface LogEntry {
+  id: string;
+  timestamp: number;
+  level: string;
+  message: string;
+}
+
+interface MarketPrice {
+  yes: number;
+  no: number;
+  lastUpdate: number;
+}
+
+export default function Home() {
+  const [running, setRunning] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [cycle, setCycle] = useState<CycleData | null>(null);
+  const [balance, setBalance] = useState<number | null>(null);
+  const [showSetBalance, setShowSetBalance] = useState(false);
+  const [inputBalance, setInputBalance] = useState('');
+  const [positions, setPositions] = useState<Position[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
-  const [activeTab, setActiveTab] = useState<'status' | 'logs' | 'config' | 'markets'>('status');
-  const [error, setError] = useState<string | null>(null);
+  const [marketPrice, setMarketPrice] = useState<MarketPrice>({ yes: 0.5, no: 0.5, lastUpdate: 0 });
 
   // 获取系统状态
-  const fetchStatus = async () => {
-    try {
-      const response = await fetch('/api/engine/status');
-      const data = await response.json();
-      
-      if (data.success) {
-        setSystemState(data.data.state);
-        setCurrentRound(data.data.currentRound);
-        setLogs(data.data.recentLogs);
-        setIsRunning(data.data.state.isRunning);
-        setError(null);
-      } else {
-        setError(data.error || 'Failed to fetch status');
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error');
+  const fetchStatus = useCallback(async () => {
+    const res = await fetch('/api/engine/status');
+    const d = await res.json();
+    if (d.success) {
+      setRunning(d.data?.state?.isRunning || false);
     }
-  };
-
-  // 启动引擎
-  const startEngine = async () => {
-    setIsLoading(true);
-    try {
-      const response = await fetch('/api/engine/start', { method: 'POST' });
-      const data = await response.json();
-      
-      if (data.success) {
-        setIsRunning(true);
-        setSystemState(data.data.state);
-        setError(null);
-      } else {
-        setError(data.error || 'Failed to start engine');
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  // 停止引擎
-  const stopEngine = async () => {
-    setIsLoading(true);
-    try {
-      const response = await fetch('/api/engine/stop', { method: 'POST' });
-      const data = await response.json();
-      
-      if (data.success) {
-        setIsRunning(false);
-        setSystemState(data.data.state);
-        setError(null);
-      } else {
-        setError(data.error || 'Failed to stop engine');
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  // 定期刷新状态
-  useEffect(() => {
-    fetchStatus();
-    const interval = setInterval(fetchStatus, 2000); // 每2秒刷新一次
-    return () => clearInterval(interval);
   }, []);
 
+  // 获取周期信息
+  const fetchCycle = useCallback(async () => {
+    const res = await fetch('/api/cycle');
+    const d = await res.json();
+    if (d.success) setCycle(d.data.cycle);
+  }, []);
+
+  // 获取余额
+  const fetchBalance = useCallback(async () => {
+    const res = await fetch('/api/balance');
+    const d = await res.json();
+    if (d.success) setBalance(d.data.balance);
+  }, []);
+
+  // 获取持仓
+  const fetchPositions = useCallback(async () => {
+    const res = await fetch('/api/positions');
+    const d = await res.json();
+    if (d.success && d.data?.positions) {
+      setPositions(d.data.positions);
+    }
+  }, []);
+
+  // 启动/停止引擎
+  const toggle = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(running ? '/api/engine/stop' : '/api/engine/start', { method: 'POST' });
+      const d = await res.json();
+      if (d.success) setRunning(!running);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 手动设置余额
+  const setManualBalance = async () => {
+    const value = parseFloat(inputBalance);
+    if (isNaN(value)) return;
+    await fetch('/api/balance', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ balance: value }),
+    });
+    setBalance(value);
+    setShowSetBalance(false);
+    setInputBalance('');
+  };
+
+  // 添加日志
+  const addLog = (level: string, message: string) => {
+    setLogs(prev => [{
+      id: Date.now().toString(),
+      timestamp: Date.now(),
+      level,
+      message,
+    }, ...prev].slice(0, 50));
+  };
+
+  // 初始化
+  useEffect(() => {
+    fetchStatus();
+    fetchBalance();
+    fetchPositions();
+    
+    // 定时刷新
+    const cycleInterval = setInterval(fetchCycle, 1000);
+    const balanceInterval = setInterval(fetchBalance, 10000);
+    const positionInterval = setInterval(fetchPositions, 30000);
+
+    return () => {
+      clearInterval(cycleInterval);
+      clearInterval(balanceInterval);
+      clearInterval(positionInterval);
+    };
+  }, [fetchStatus, fetchCycle, fetchBalance, fetchPositions]);
+
+  // 模拟价格更新（实际应从 API 获取）
+  useEffect(() => {
+    if (!running) return;
+    
+    const priceInterval = setInterval(() => {
+      // 模拟价格波动
+      const random = Math.random() * 0.02 - 0.01;
+      setMarketPrice(prev => ({
+        yes: Math.max(0.01, Math.min(0.99, prev.yes + random)),
+        no: Math.max(0.01, Math.min(0.99, prev.no - random)),
+        lastUpdate: Date.now(),
+      }));
+    }, 1000);
+
+    return () => clearInterval(priceInterval);
+  }, [running]);
+
+  const formatTime = (seconds: number) => {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  };
+
+  const formatTime2 = (ts: number) => {
+    const d = new Date(ts);
+    return d.toLocaleTimeString();
+  };
+
   return (
-    <div className="min-h-screen bg-background text-foreground p-4 md:p-8">
+    <main style={{ maxWidth: 900, margin: '0 auto', padding: 20 }}>
       {/* 头部 */}
-      <header className="flex flex-col md:flex-row items-start md:items-center justify-between mb-8 gap-4">
-        <div>
-          <h1 className="text-3xl font-bold flex items-center gap-2">
-            <TrendingUp className="h-8 w-8 text-primary" />
-            Polymarket 快速下跌对冲套利
-          </h1>
-          <p className="text-muted-foreground mt-2">
-            自动监控比特币15分钟市场，执行快速下跌对冲套利策略
-          </p>
-        </div>
-        
-        <div className="flex items-center gap-4">
-          <Badge 
-            variant={isRunning ? "default" : "secondary"} 
-            className="text-sm py-2 px-4"
-          >
-            <Activity className="h-4 w-4 mr-2" />
-            {isRunning ? '运行中' : '已停止'}
-          </Badge>
-          
-          <div className="flex gap-2">
-            {!isRunning ? (
-              <Button 
-                onClick={startEngine} 
-                disabled={isLoading}
-                size="lg"
-                className="gap-2"
-              >
-                <Play className="h-5 w-5" />
-                启动引擎
-              </Button>
-            ) : (
-              <Button 
-                onClick={stopEngine} 
-                disabled={isLoading}
-                variant="destructive"
-                size="lg"
-                className="gap-2"
-              >
-                <Square className="h-5 w-5" />
-                停止引擎
-              </Button>
-            )}
-          </div>
-        </div>
+      <header style={{ marginBottom: 20 }}>
+        <h1 style={{ marginBottom: 5, fontSize: 24 }}>比特币15分钟涨跌预测</h1>
+        <p style={{ color: '#666', margin: 0 }}>实时监控 · 快速下跌对冲套利</p>
       </header>
 
-      {/* 错误提示 */}
-      {error && (
-        <div className="bg-destructive/10 text-destructive px-4 py-3 rounded-lg mb-6">
-          <strong>错误：</strong> {error}
+      {/* 周期倒计时 */}
+      <div style={{
+        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+        padding: 20,
+        borderRadius: 12,
+        marginBottom: 15,
+        color: 'white',
+      }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div>
+            <p style={{ margin: 0, fontSize: 12, opacity: 0.9 }}>距离周期结束</p>
+            <p style={{ margin: '5px 0 0 0', fontSize: 36, fontWeight: 'bold', fontFamily: 'monospace' }}>
+              {cycle ? formatTime(cycle.remainingSeconds) : '00:00'}
+            </p>
+          </div>
+          <div style={{ textAlign: 'right' }}>
+            <p style={{ margin: 0, fontSize: 12, opacity: 0.9 }}>周期进度</p>
+            <p style={{ margin: '5px 0 0 0', fontSize: 20, fontWeight: 'bold' }}>
+              {cycle ? cycle.progress.toFixed(1) : 0}%
+            </p>
+          </div>
         </div>
-      )}
-
-      {/* 标签页 */}
-      <div className="flex gap-2 mb-6 border-b">
-        <Button
-          variant={activeTab === 'status' ? 'default' : 'ghost'}
-          onClick={() => setActiveTab('status')}
-          className="rounded-b-none"
-        >
-          系统状态
-        </Button>
-        <Button
-          variant={activeTab === 'logs' ? 'default' : 'ghost'}
-          onClick={() => setActiveTab('logs')}
-          className="rounded-b-none"
-        >
-          实时日志
-        </Button>
-        <Button
-          variant={activeTab === 'config' ? 'default' : 'ghost'}
-          onClick={() => setActiveTab('config')}
-          className="rounded-b-none"
-        >
-          <Settings className="h-4 w-4 mr-2" />
-          配置
-        </Button>
-        <Button
-          variant={activeTab === 'markets' ? 'default' : 'ghost'}
-          onClick={() => setActiveTab('markets')}
-          className="rounded-b-none"
-        >
-          市场列表
-        </Button>
+        <div style={{ marginTop: 10, height: 6, background: 'rgba(255,255,255,0.3)', borderRadius: 3, overflow: 'hidden' }}>
+          <div style={{ width: cycle ? `${cycle.progress}%` : '0%', height: '100%', background: 'white', borderRadius: 3, transition: 'width 0.5s' }} />
+        </div>
       </div>
 
-      {/* 内容区域 */}
-      {activeTab === 'status' && (
-        <div className="grid gap-6">
-          {/* 系统状态卡片 */}
-          <SystemStatusCard state={systemState} />
-          
-          {/* 当前轮次信息 */}
-          <RoundInfoCard round={currentRound} />
-          
-          {/* 策略说明 */}
-          <Card>
-            <CardHeader>
-              <CardTitle>策略说明</CardTitle>
-              <CardDescription>快速下跌对冲套利策略详解</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div>
-                <h4 className="font-semibold mb-2">核心参数</h4>
-                <ul className="list-disc list-inside space-y-1 text-sm text-muted-foreground">
-                  <li>对冲阈值：0.93（Leg1 + Leg2 ≤ 0.93时触发）</li>
-                  <li>下跌阈值：15%（3秒内下跌≥15%触发Leg1）</li>
-                  <li>监控窗口：3分钟（每轮开始后前3分钟监控）</li>
-                  <li>市场周期：15分钟（比特币15分钟市场）</li>
-                </ul>
-              </div>
-              
-              <div>
-                <h4 className="font-semibold mb-2">执行流程</h4>
-                <ol className="list-decimal list-inside space-y-1 text-sm text-muted-foreground">
-                  <li>每轮开始时，启动3分钟倒计时监控</li>
-                  <li>如果YES或NO价格在3秒内下跌≥15%，买入下跌侧（Leg1）</li>
-                  <li>监控另一侧价格，当Leg1 + 另一侧价格 ≤ 0.93时，买入另一侧（Leg2）</li>
-                  <li>完成对冲，锁定利润（理论利润 = 1 - sumPrice）</li>
-                  <li>如果3分钟内无信号或无法对冲，放弃本轮，等待下一轮</li>
-                </ol>
-              </div>
-              
-              <div>
-                <h4 className="font-semibold mb-2">风险控制</h4>
-                <ul className="list-disc list-inside space-y-1 text-sm text-muted-foreground">
-                  <li>只交易高流动性市场（买卖价差&lt;5%）</li>
-                  <li>Leg2为吃单操作，自动扣除约1.56%手续费</li>
-                  <li>单市场最大暴露自动控制</li>
-                  <li>使用Safe账户自托管，确保资金安全</li>
-                </ul>
-              </div>
-            </CardContent>
-          </Card>
+      {/* 主要信息网格 */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 15, marginBottom: 15 }}>
+        {/* 余额卡片 */}
+        <div style={{ background: '#e8f5e9', padding: 15, borderRadius: 10, borderLeft: '4px solid #4caf50' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div>
+              <p style={{ margin: 0, fontSize: 12, color: '#388e3c' }}>Polymarket 余额</p>
+              <p style={{ margin: '5px 0 0 0', fontSize: 24, fontWeight: 'bold', color: '#2e7d32' }}>
+                {balance !== null ? balance.toFixed(2) : '...'} USDC
+              </p>
+            </div>
+            <button onClick={() => setShowSetBalance(!showSetBalance)} style={{ padding: '6px 12px', background: '#4caf50', color: 'white', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}>
+              设置
+            </button>
+          </div>
+          {showSetBalance && (
+            <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
+              <input type="number" value={inputBalance} onChange={e => setInputBalance(e.target.value)} placeholder="输入余额" style={{ flex: 1, padding: 8, borderRadius: 4, border: '1px solid #ccc' }} />
+              <button onClick={setManualBalance} style={{ padding: '8px 16px', background: '#2e7d32', color: 'white', border: 'none', borderRadius: 4, cursor: 'pointer' }}>保存</button>
+            </div>
+          )}
         </div>
-      )}
 
-      {activeTab === 'logs' && (
-        <LogPanel logs={logs} />
-      )}
+        {/* 实时价格卡片 */}
+        <div style={{ background: '#e3f2fd', padding: 15, borderRadius: 10, borderLeft: '4px solid #2196f3' }}>
+          <p style={{ margin: 0, fontSize: 12, color: '#1976d2' }}>实时价格</p>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 5 }}>
+            <div>
+              <span style={{ fontSize: 12, color: '#666' }}>YES:</span>
+              <span style={{ fontSize: 18, fontWeight: 'bold', marginLeft: 5, color: '#1976d2' }}>
+                {marketPrice.yes.toFixed(4)}
+              </span>
+            </div>
+            <div>
+              <span style={{ fontSize: 12, color: '#666' }}>NO:</span>
+              <span style={{ fontSize: 18, fontWeight: 'bold', marginLeft: 5, color: '#d32f2f' }}>
+                {marketPrice.no.toFixed(4)}
+              </span>
+            </div>
+          </div>
+          <p style={{ margin: '5px 0 0 0', fontSize: 10, color: '#888' }}>
+            总和: {(marketPrice.yes + marketPrice.no).toFixed(4)}
+            {(marketPrice.yes + marketPrice.no) <= 0.93 && (
+              <span style={{ color: '#4caf50', marginLeft: 5 }}>✓ 对冲机会!</span>
+            )}
+          </p>
+        </div>
+      </div>
 
-      {activeTab === 'config' && (
-        <ConfigPanel />
-      )}
+      {/* 系统状态和策略配置 */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 15, marginBottom: 15 }}>
+        {/* 系统状态 */}
+        <div style={{ background: 'white', padding: 15, borderRadius: 10, border: '1px solid #eee' }}>
+          <h3 style={{ margin: '0 0 10px 0', fontSize: 14 }}>系统状态</h3>
+          <p style={{ margin: '0 0 10px 0' }}>
+            状态: <span style={{ color: running ? '#4caf50' : '#f44336', fontWeight: 'bold' }}>
+              {running ? '✓ 运行中' : '✗ 已停止'}
+            </span>
+          </p>
+          <button onClick={toggle} disabled={loading} style={{
+            width: '100%',
+            padding: '10px 20px',
+            background: running ? '#f44336' : '#4caf50',
+            color: 'white',
+            border: 'none',
+            borderRadius: 6,
+            fontSize: 14,
+            cursor: loading ? 'not-allowed' : 'pointer',
+            opacity: loading ? 0.7 : 1,
+          }}>
+            {loading ? '处理中...' : running ? '停止引擎' : '启动引擎'}
+          </button>
+        </div>
 
-      {activeTab === 'markets' && (
-        <MarketsPanel />
-      )}
-    </div>
+        {/* 策略配置 */}
+        <div style={{ background: 'white', padding: 15, borderRadius: 10, border: '1px solid #eee' }}>
+          <h3 style={{ margin: '0 0 10px 0', fontSize: 14 }}>策略配置</h3>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+            <div style={{ background: '#f5f5f5', padding: 8, borderRadius: 4 }}>
+              <p style={{ margin: 0, fontSize: 10, color: '#888' }}>对冲阈值</p>
+              <p style={{ margin: '2px 0 0 0', fontSize: 14, fontWeight: 'bold' }}>0.93</p>
+            </div>
+            <div style={{ background: '#f5f5f5', padding: 8, borderRadius: 4 }}>
+              <p style={{ margin: 0, fontSize: 10, color: '#888' }}>下跌阈值</p>
+              <p style={{ margin: '2px 0 0 0', fontSize: 14, fontWeight: 'bold' }}>15% / 3秒</p>
+            </div>
+            <div style={{ background: '#f5f5f5', padding: 8, borderRadius: 4 }}>
+              <p style={{ margin: 0, fontSize: 10, color: '#888' }}>仓位大小</p>
+              <p style={{ margin: '2px 0 0 0', fontSize: 14, fontWeight: 'bold' }}>1 USDC</p>
+            </div>
+            <div style={{ background: '#f5f5f5', padding: 8, borderRadius: 4 }}>
+              <p style={{ margin: 0, fontSize: 10, color: '#888' }}>最大暴露</p>
+              <p style={{ margin: '2px 0 0 0', fontSize: 14, fontWeight: 'bold' }}>100 USDC</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* 持仓和日志 */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 15 }}>
+        {/* 持仓 */}
+        <div style={{ background: 'white', padding: 15, borderRadius: 10, border: '1px solid #eee' }}>
+          <h3 style={{ margin: '0 0 10px 0', fontSize: 14 }}>当前持仓</h3>
+          {positions.length === 0 ? (
+            <p style={{ color: '#888', fontSize: 12, margin: 0 }}>暂无持仓</p>
+          ) : (
+            <div style={{ maxHeight: 150, overflow: 'auto' }}>
+              {positions.map((p, i) => (
+                <div key={i} style={{ padding: '8px 0', borderBottom: '1px solid #eee' }}>
+                  <p style={{ margin: 0, fontSize: 12 }}>{p.asset} - {p.side}</p>
+                  <p style={{ margin: '2px 0 0 0', fontSize: 10, color: '#666' }}>
+                    数量: {p.size} | 价格: {p.avgPrice} | PnL: {p.pnl > 0 ? '+' : ''}{p.pnl.toFixed(2)}
+                  </p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* 日志 */}
+        <div style={{ background: 'white', padding: 15, borderRadius: 10, border: '1px solid #eee' }}>
+          <h3 style={{ margin: '0 0 10px 0', fontSize: 14 }}>交易日志</h3>
+          {logs.length === 0 ? (
+            <p style={{ color: '#888', fontSize: 12, margin: 0 }}>暂无日志</p>
+          ) : (
+            <div style={{ maxHeight: 150, overflow: 'auto', fontFamily: 'monospace', fontSize: 11 }}>
+              {logs.map((log) => (
+                <div key={log.id} style={{ padding: '4px 0', borderBottom: '1px solid #f5f5f5' }}>
+                  <span style={{ color: '#888' }}>{formatTime2(log.timestamp)}</span>
+                  <span style={{ 
+                    marginLeft: 8, 
+                    color: log.level === 'ERROR' ? '#f44336' : log.level === 'WARN' ? '#ff9800' : '#4caf50' 
+                  }}>
+                    [{log.level}]
+                  </span>
+                  <span style={{ marginLeft: 8 }}>{log.message}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 策略说明 */}
+      <div style={{ background: '#fff3e0', padding: 15, borderRadius: 10, marginTop: 15, borderLeft: '4px solid #ff9800' }}>
+        <h4 style={{ margin: '0 0 8px 0', color: '#e65100', fontSize: 13 }}>策略说明</h4>
+        <p style={{ margin: 0, fontSize: 12, color: '#bf360c' }}>
+          当检测到 YES/NO 价格在 3 秒内下跌 ≥15% 时，自动买入下跌侧（Leg1）。
+          当 Leg1 价格 + 另一侧价格 ≤ 0.93 时，买入另一侧（Leg2）完成对冲。
+          理论利润 = 1 - 总价格 - 手续费。
+        </p>
+      </div>
+
+      {/* 风险提示 */}
+      <div style={{ background: '#ffebee', padding: 15, borderRadius: 10, marginTop: 10, borderLeft: '4px solid #f44336' }}>
+        <h4 style={{ margin: '0 0 8px 0', color: '#c62828', fontSize: 13 }}>⚠️ 风险提示</h4>
+        <p style={{ margin: 0, fontSize: 12, color: '#b71c1c' }}>
+          自动交易存在风险，请确保您了解策略原理并控制好仓位。
+          建议先用小额资金测试，确认策略正常后再增加仓位。
+        </p>
+      </div>
+    </main>
   );
 }
