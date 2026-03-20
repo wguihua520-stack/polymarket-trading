@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
+import ConfigWizard from '@/components/ConfigWizard';
 
 interface CycleData {
   cycleId: string;
@@ -73,6 +74,7 @@ export default function Home() {
   });
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [priceLoading, setPriceLoading] = useState(false);
+  const [showConfigWizard, setShowConfigWizard] = useState(false);
 
   // 获取系统状态
   const fetchStatus = useCallback(async () => {
@@ -248,9 +250,28 @@ export default function Home() {
   return (
     <main style={{ maxWidth: 1000, margin: '0 auto', padding: 20 }}>
       {/* 头部 */}
-      <header style={{ marginBottom: 20 }}>
-        <h1 style={{ marginBottom: 5, fontSize: 24 }}>比特币15分钟涨跌预测</h1>
-        <p style={{ color: '#666', margin: 0 }}>实时监控 · 快速下跌对冲套利</p>
+      <header style={{ marginBottom: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+        <div>
+          <h1 style={{ marginBottom: 5, fontSize: 24 }}>比特币15分钟涨跌预测</h1>
+          <p style={{ color: '#666', margin: 0 }}>实时监控 · 快速下跌对冲套利</p>
+        </div>
+        <button 
+          onClick={() => setShowConfigWizard(true)}
+          style={{
+            padding: '8px 16px',
+            background: '#2196f3',
+            color: 'white',
+            border: 'none',
+            borderRadius: 6,
+            fontSize: 14,
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+          }}
+        >
+          ⚙️ 配置
+        </button>
       </header>
 
       {/* 系统状态卡片 */}
@@ -568,27 +589,44 @@ export default function Home() {
         <div style={{ background: '#e3f2fd', padding: 15, borderRadius: 10, marginTop: 10, borderLeft: '4px solid #2196f3' }}>
           <h4 style={{ margin: '0 0 8px 0', color: '#1565c0', fontSize: 13 }}>⚙️ 配置指南</h4>
           <p style={{ margin: '0 0 10px 0', fontSize: 12, color: '#0d47a1' }}>
-            要启用真实交易，请配置以下环境变量：
+            要启用真实交易，请点击右上角「配置」按钮进行设置。
           </p>
-          <ul style={{ margin: 0, paddingLeft: 20, fontSize: 11, color: '#1565c0' }}>
-            <li style={{ marginBottom: 4 }}>
+          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 12 }}>
               <code>WALLET_PRIVATE_KEY</code>: 
-              {!systemStatus.config.hasPrivateKey && <span style={{ color: '#f44336' }}> 未配置</span>}
-              {systemStatus.config.hasPrivateKey && <span style={{ color: '#4caf50' }}> ✓ 已配置</span>}
-            </li>
-            <li style={{ marginBottom: 4 }}>
+              {systemStatus.config.hasPrivateKey ? 
+                <span style={{ color: '#4caf50', marginLeft: 4 }}>✓</span> : 
+                <span style={{ color: '#f44336', marginLeft: 4 }}>✗</span>
+              }
+            </span>
+            <span style={{ fontSize: 12 }}>
               <code>POLYMARKET_API_KEY</code>: 
-              {!systemStatus.config.hasApiKey && <span style={{ color: '#f44336' }}> 未配置</span>}
-              {systemStatus.config.hasApiKey && <span style={{ color: '#4caf50' }}> ✓ 已配置</span>}
-            </li>
-            <li style={{ marginBottom: 4 }}>
+              {systemStatus.config.hasApiKey ? 
+                <span style={{ color: '#4caf50', marginLeft: 4 }}>✓</span> : 
+                <span style={{ color: '#f44336', marginLeft: 4 }}>✗</span>
+              }
+            </span>
+            <span style={{ fontSize: 12 }}>
               <code>POLYMARKET_API_SECRET</code>: 
-              {!systemStatus.config.hasApiSecret && <span style={{ color: '#f44336' }}> 未配置</span>}
-              {systemStatus.config.hasApiSecret && <span style={{ color: '#4caf50' }}> ✓ 已配置</span>}
-            </li>
-          </ul>
+              {systemStatus.config.hasApiSecret ? 
+                <span style={{ color: '#4caf50', marginLeft: 4 }}>✓</span> : 
+                <span style={{ color: '#f44336', marginLeft: 4 }}>✗</span>
+              }
+            </span>
+          </div>
         </div>
       )}
+
+      {/* 配置向导 */}
+      <ConfigWizard 
+        isOpen={showConfigWizard} 
+        onClose={() => setShowConfigWizard(false)}
+        onComplete={() => {
+          fetchStatus();
+          fetchBalance();
+          addLog('INFO', '配置完成');
+        }}
+      />
     </main>
   );
 }
