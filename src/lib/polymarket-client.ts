@@ -1,5 +1,6 @@
 import type { MarketData, PriceData, OrderRequest, OrderResponse, ApiResponse, TradeSide } from '@/types/trading';
 import { POLYMARKET_CONFIG, getConfig } from '@/config/strategy';
+import { calculateTokenIds, formatTokenId } from './token-utils';
 
 /**
  * 当前活跃市场信息
@@ -92,14 +93,31 @@ export class PolymarketClient {
       const upToken = tokens.find((t: any) => t.outcome?.toUpperCase() === 'UP');
       const downToken = tokens.find((t: any) => t.outcome?.toUpperCase() === 'DOWN');
       
-      if (!upToken || !downToken) {
-        throw new Error('Market tokens not found');
+      let upTokenId: string;
+      let downTokenId: string;
+      
+      if (upToken?.token_id && downToken?.token_id) {
+        // 优先使用 API 返回的 Token ID（最准确）
+        upTokenId = upToken.token_id;
+        downTokenId = downToken.token_id;
+        console.log('[Market] Using Token IDs from API');
+      } else if (btcMarket.condition_id) {
+        // 备用：从 conditionId 计算 Token ID
+        const calculated = calculateTokenIds(btcMarket.condition_id);
+        upTokenId = calculated.upTokenId;
+        downTokenId = calculated.downTokenId;
+        console.log('[Market] Calculated Token IDs from conditionId');
+      } else {
+        throw new Error('Cannot determine Token IDs');
       }
+      
+      console.log(`[Market] UP Token: ${formatTokenId(upTokenId)}`);
+      console.log(`[Market] DOWN Token: ${formatTokenId(downTokenId)}`);
       
       // 获取实时价格（从订单簿）
       const [upPrice, downPrice] = await Promise.all([
-        this.getTokenPrice(upToken.token_id),
-        this.getTokenPrice(downToken.token_id),
+        this.getTokenPrice(upTokenId),
+        this.getTokenPrice(downTokenId),
       ]);
       
       // 解析市场时间
@@ -109,8 +127,8 @@ export class PolymarketClient {
       this.activeMarket = {
         conditionId: btcMarket.condition_id,
         question: btcMarket.question,
-        upTokenId: upToken.token_id,
-        downTokenId: downToken.token_id,
+        upTokenId,
+        downTokenId,
         startTime,
         endTime,
         prices: {
@@ -122,9 +140,8 @@ export class PolymarketClient {
       this.marketCacheTime = now;
       
       console.log(`[Market] Active market: ${btcMarket.question}`);
-      console.log(`[Market] UP Token: ${upToken.token_id}`);
-      console.log(`[Market] DOWN Token: ${downToken.token_id}`);
       console.log(`[Market] Prices: UP=${upPrice.toFixed(4)}, DOWN=${downPrice.toFixed(4)}`);
+      console.log(`[Market] End time: ${new Date(endTime).toLocaleTimeString()}`);
       
       return { success: true, data: this.activeMarket };
       
