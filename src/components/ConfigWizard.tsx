@@ -36,6 +36,8 @@ interface Market {
   active: boolean;
   liquidity?: number;
   volume?: number;
+  upTokenId?: string;
+  downTokenId?: string;
 }
 
 export default function ConfigWizard({ isOpen, onClose, onComplete }: ConfigWizardProps) {
@@ -180,8 +182,10 @@ export default function ConfigWizard({ isOpen, onClose, onComplete }: ConfigWiza
           marketId: selectedMarket.marketId,
           conditionId: selectedMarket.conditionId,
           question: selectedMarket.question,
-          yesTokenId: selectedMarket.tokens.find(t => t.outcome === 'YES')?.tokenId || '',
-          noTokenId: selectedMarket.tokens.find(t => t.outcome === 'NO')?.tokenId || '',
+          yesTokenId: selectedMarket.tokens.find(t => t.outcome === 'UP' || t.outcome === 'YES')?.tokenId || '',
+          noTokenId: selectedMarket.tokens.find(t => t.outcome === 'DOWN' || t.outcome === 'NO')?.tokenId || '',
+          upTokenId: selectedMarket.tokens.find(t => t.outcome === 'UP')?.tokenId || '',
+          downTokenId: selectedMarket.tokens.find(t => t.outcome === 'DOWN')?.tokenId || '',
           enabled: true,
         }),
       });

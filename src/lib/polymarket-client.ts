@@ -54,6 +54,15 @@ export class PolymarketClient {
         throw new Error('Failed to parse market data');
       }
       
+      // 获取真实的 Token IDs
+      if (market.tokens) {
+        const upToken = market.tokens.find((t: any) => t.outcome?.toUpperCase() === 'UP');
+        const downToken = market.tokens.find((t: any) => t.outcome?.toUpperCase() === 'DOWN');
+        
+        if (upToken) (parsed as any).upTokenId = upToken.token_id;
+        if (downToken) (parsed as any).downTokenId = downToken.token_id;
+      }
+      
       return { success: true, data: parsed };
     } catch (error) {
       console.error('Failed to fetch Bitcoin 15min market:', error);

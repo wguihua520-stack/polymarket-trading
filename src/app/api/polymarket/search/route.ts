@@ -1,50 +1,113 @@
 import { NextResponse } from 'next/server';
-import { getPolymarketClient } from '@/lib/polymarket-client';
 
 /**
  * 搜索 Polymarket 市场
  * GET /api/polymarket/search?query=bitcoin
  */
+
+interface MarketToken {
+  tokenId: string;
+  outcome: string;
+  price: number;
+}
+
+interface MarketResult {
+  marketId: string;
+  conditionId: string;
+  question: string;
+  tokens: MarketToken[];
+  spread: number;
+  active: boolean;
+  liquidity?: number;
+  volume?: number;
+}
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const query = searchParams.get('query') || searchParams.get('q') || '';
   const limit = parseInt(searchParams.get('limit') || '50');
 
   try {
-    const client = getPolymarketClient();
+    // 尝试从 Gamma API 获取真实市场数据
+    const response = await fetch(
+      `https://gamma-api.polymarket.com/markets?limit=${limit}&closed=false&active=true`,
+      {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json',
+        },
+        cache: 'no-store',
+      }
+    );
     
-    // 使用搜索功能
-    const response = await client.searchMarkets(query);
-    
-    if (!response.success) {
-      // API 不可用，返回示例数据
+    if (response.ok) {
+      const data = await response.json();
+      
+      const queryLower = query.toLowerCase();
+      
+      // 过滤并解析市场
+      const markets: MarketResult[] = data
+        .filter((market: any) => {
+          if (!query) return true;
+          return market.question?.toLowerCase().includes(queryLower) ||
+                 market.description?.toLowerCase().includes(queryLower);
+        })
+        .map((market: any) => {
+          const tokens: MarketToken[] = [];
+          
+          // 解析 tokens
+          if (market.tokens && Array.isArray(market.tokens)) {
+            for (const token of market.tokens) {
+              const price = extractPrice(token);
+              tokens.push({
+                tokenId: token.token_id,
+                outcome: token.outcome,
+                price,
+              });
+            }
+          }
+          
+          // 计算价差
+          const upToken = tokens.find(t => t.outcome?.toUpperCase() === 'UP');
+          const downToken = tokens.find(t => t.outcome?.toUpperCase() === 'DOWN');
+          const yesToken = tokens.find(t => t.outcome?.toUpperCase() === 'YES');
+          const noToken = tokens.find(t => t.outcome?.toUpperCase() === 'NO');
+          
+          let spread = 0;
+          if (upToken && downToken) {
+            spread = Math.abs(1 - (upToken.price + downToken.price));
+          } else if (yesToken && noToken) {
+            spread = Math.abs(1 - (yesToken.price + noToken.price));
+          }
+          
+          return {
+            marketId: market.condition_id || market.id,
+            conditionId: market.condition_id || market.id,
+            question: market.question,
+            tokens,
+            spread,
+            active: market.active !== false,
+            liquidity: parseFloat(market.volume || market.liquidity || '0') || 0,
+            volume: parseFloat(market.volume || '0') || 0,
+          };
+        })
+        .filter((m: MarketResult) => m.tokens.length >= 2);
+      
       return NextResponse.json({
         success: true,
-        data: getExampleSearchResults(query, limit),
-        source: 'example',
-        count: getExampleSearchResults(query, limit).length,
-        message: '无法连接 Polymarket API，显示示例数据。部署到 Vercel 后将获取真实市场。',
+        data: markets,
+        source: 'gamma-api',
+        count: markets.length,
       });
     }
     
-    const markets = (response.data || []).slice(0, limit).map(market => ({
-      marketId: market.marketId,
-      conditionId: market.marketId,
-      question: market.question,
-      tokens: [
-        { tokenId: `yes-${market.marketId}`, outcome: 'YES', price: market.yesPrice },
-        { tokenId: `no-${market.marketId}`, outcome: 'NO', price: market.noPrice },
-      ],
-      spread: market.spread,
-      active: market.status === 'ACTIVE',
-      liquidity: market.liquidity,
-    }));
-
+    // Gamma API 失败，返回示例数据
     return NextResponse.json({
       success: true,
-      data: markets,
-      source: 'api',
-      count: markets.length,
+      data: getExampleSearchResults(query, limit),
+      source: 'example',
+      count: getExampleSearchResults(query, limit).length,
+      message: '无法连接 Polymarket API，显示示例数据',
     });
     
   } catch (error) {
@@ -56,63 +119,67 @@ export async function GET(request: Request) {
       data: getExampleSearchResults(query, limit),
       source: 'example',
       count: getExampleSearchResults(query, limit).length,
-      message: '网络受限，显示示例数据。部署到 Vercel 后将搜索真实市场。',
+      message: '网络受限，显示示例数据',
     });
   }
 }
 
 /**
+ * 从 token 数据中提取价格
+ */
+function extractPrice(token: any): number {
+  const price = token.price;
+  if (typeof price === 'number') return price;
+  if (typeof price === 'string') return parseFloat(price) || 0.5;
+  if (typeof price === 'object') {
+    return parseFloat(price.price || price.bestAsk || price.bestBid || '0.5') || 0.5;
+  }
+  return 0.5;
+}
+
+/**
  * 获取示例搜索结果
  */
-function getExampleSearchResults(query: string, limit: number) {
-  const allExamples = [
+function getExampleSearchResults(query: string, limit: number): MarketResult[] {
+  const allExamples: MarketResult[] = [
     {
-      marketId: 'btc-15min-up',
-      conditionId: 'btc-15min-up',
-      question: 'Will Bitcoin price increase in the next 15 minutes?',
+      marketId: 'btc-15min-up-down',
+      conditionId: 'btc-15min-up-down',
+      question: 'Bitcoin Up or Down - 15 Minutes',
       tokens: [
-        { tokenId: 'btc-yes', outcome: 'YES', price: 0.48 },
-        { tokenId: 'btc-no', outcome: 'NO', price: 0.52 },
+        { tokenId: 'btc-15min-up-token', outcome: 'UP', price: 0.48 },
+        { tokenId: 'btc-15min-down-token', outcome: 'DOWN', price: 0.52 },
       ],
       spread: 0.02,
       active: true,
       liquidity: 50000,
+      volume: 150000,
     },
     {
-      marketId: 'btc-1hr-above',
-      conditionId: 'btc-1hr-above',
-      question: 'Will Bitcoin be above $70,000 in 1 hour?',
+      marketId: 'btc-1hr-up-down',
+      conditionId: 'btc-1hr-up-down',
+      question: 'Bitcoin Up or Down - 1 Hour',
       tokens: [
-        { tokenId: 'btc-1hr-yes', outcome: 'YES', price: 0.45 },
-        { tokenId: 'btc-1hr-no', outcome: 'NO', price: 0.55 },
+        { tokenId: 'btc-1hr-up-token', outcome: 'UP', price: 0.45 },
+        { tokenId: 'btc-1hr-down-token', outcome: 'DOWN', price: 0.55 },
       ],
       spread: 0.025,
       active: true,
       liquidity: 35000,
+      volume: 120000,
     },
     {
-      marketId: 'eth-hourly',
-      conditionId: 'eth-hourly',
-      question: 'Will Ethereum increase by 2% in the next hour?',
+      marketId: 'eth-15min-up-down',
+      conditionId: 'eth-15min-up-down',
+      question: 'Ethereum Up or Down - 15 Minutes',
       tokens: [
-        { tokenId: 'eth-yes', outcome: 'YES', price: 0.35 },
-        { tokenId: 'eth-no', outcome: 'NO', price: 0.65 },
+        { tokenId: 'eth-15min-up-token', outcome: 'UP', price: 0.50 },
+        { tokenId: 'eth-15min-down-token', outcome: 'DOWN', price: 0.50 },
       ],
       spread: 0.03,
       active: true,
       liquidity: 25000,
-    },
-    {
-      marketId: 'sol-daily',
-      conditionId: 'sol-daily',
-      question: 'Will Solana reach $200 today?',
-      tokens: [
-        { tokenId: 'sol-yes', outcome: 'YES', price: 0.28 },
-        { tokenId: 'sol-no', outcome: 'NO', price: 0.72 },
-      ],
-      spread: 0.035,
-      active: true,
-      liquidity: 20000,
+      volume: 80000,
     },
   ];
   

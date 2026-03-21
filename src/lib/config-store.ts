@@ -26,8 +26,10 @@ export interface MarketConfig {
   marketId: string;
   conditionId: string;
   question: string;
-  yesTokenId: string;
-  noTokenId: string;
+  yesTokenId: string;  // UP token ID
+  noTokenId: string;   // DOWN token ID
+  upTokenId?: string;  // 显式的 UP token ID
+  downTokenId?: string; // 显式的 DOWN token ID
   enabled: boolean;
 }
 
