@@ -249,73 +249,111 @@ export class PolymarketCLOBClient {
    * 获取订单簿
    */
   async getOrderBook(tokenId: string): Promise<OrderBookSummary | null> {
+    // 如果不是真实的 token ID，使用模拟订单簿
+    if (!this.isRealTokenId(tokenId)) {
+      return this.getSimulatedOrderBook(tokenId);
+    }
+    
     if (this.mode === 'simulation') {
       return this.getSimulatedOrderBook(tokenId);
     }
 
-    const data = await this.fetchRealApi<any>('GET', `/book?token_id=${tokenId}`);
-    if (!data) {
+    try {
+      const data = await this.fetchRealApi<any>('GET', `/book?token_id=${tokenId}`);
+      if (!data) {
+        return this.getSimulatedOrderBook(tokenId);
+      }
+
+      return {
+        market: data.market || 'Unknown',
+        asset: data.asset || tokenId,
+        bids: (data.bids || []).map((b: any) => ({ 
+          price: parseFloat(b.price), 
+          size: parseFloat(b.size) 
+        })),
+        asks: (data.asks || []).map((a: any) => ({ 
+          price: parseFloat(a.price), 
+          size: parseFloat(a.size) 
+        })),
+        hash: data.hash || '',
+      };
+    } catch (error) {
+      console.error('Get order book error, falling back to simulation:', error);
       return this.getSimulatedOrderBook(tokenId);
     }
+  }
 
-    return {
-      market: data.market || 'Unknown',
-      asset: data.asset || tokenId,
-      bids: (data.bids || []).map((b: any) => ({ 
-        price: parseFloat(b.price), 
-        size: parseFloat(b.size) 
-      })),
-      asks: (data.asks || []).map((a: any) => ({ 
-        price: parseFloat(a.price), 
-        size: parseFloat(a.size) 
-      })),
-      hash: data.hash || '',
-    };
+  /**
+   * 检查是否为真实的 Token ID 格式
+   * 真实的 Polymarket Token ID 通常是 66 字符的十六进制字符串（0x 开头）
+   */
+  private isRealTokenId(tokenId: string): boolean {
+    // 真实 token ID 格式: 0x + 64位十六进制
+    return /^0x[a-fA-F0-9]{64}$/.test(tokenId);
   }
 
   /**
    * 获取价格
    */
   async getPrice(tokenId: string): Promise<number> {
+    // 如果不是真实的 token ID，使用模拟价格
+    if (!this.isRealTokenId(tokenId)) {
+      return this.getSimulatedPrice(tokenId);
+    }
+    
     if (this.mode === 'simulation') {
       return this.getSimulatedPrice(tokenId);
     }
 
-    const data = await this.fetchRealApi<{ price: string }>('GET', `/price?token_id=${tokenId}`);
-    if (!data?.price) {
+    try {
+      const data = await this.fetchRealApi<{ price: string }>('GET', `/price?token_id=${tokenId}`);
+      if (!data?.price) {
+        return this.getSimulatedPrice(tokenId);
+      }
+      return parseFloat(data.price);
+    } catch (error) {
+      console.error('Get price error, falling back to simulation:', error);
       return this.getSimulatedPrice(tokenId);
     }
-
-    return parseFloat(data.price);
   }
 
   /**
    * 获取多个价格
    */
   async getPrices(tokenIds: string[]): Promise<Record<string, number>> {
-    if (this.mode === 'simulation') {
-      const prices: Record<string, number> = {};
-      for (const id of tokenIds) {
-        prices[id] = this.getSimulatedPrice(id);
-      }
+    const prices: Record<string, number> = {};
+    
+    // 分离真实 token ID 和模拟 token ID
+    const realTokenIds = tokenIds.filter(id => this.isRealTokenId(id));
+    const simTokenIds = tokenIds.filter(id => !this.isRealTokenId(id));
+    
+    // 模拟 token ID 使用模拟价格
+    for (const id of simTokenIds) {
+      prices[id] = this.getSimulatedPrice(id);
+    }
+    
+    // 如果没有真实的 token ID 或是模拟模式，直接返回
+    if (realTokenIds.length === 0 || this.mode === 'simulation') {
       return prices;
     }
 
-    // 批量查询
-    const prices: Record<string, number> = {};
-    const params = tokenIds.map(id => `token_id=${id}`).join('&');
-    const data = await this.fetchRealApi<Array<{ token_id: string; price: string }>>(
-      'GET', 
-      `/prices?${params}`
-    );
+    // 批量查询真实价格
+    try {
+      const params = realTokenIds.map(id => `token_id=${id}`).join('&');
+      const data = await this.fetchRealApi<Array<{ token_id: string; price: string }>>(
+        'GET', 
+        `/prices?${params}`
+      );
 
-    if (data) {
-      for (const item of data) {
-        prices[item.token_id] = parseFloat(item.price);
+      if (data) {
+        for (const item of data) {
+          prices[item.token_id] = parseFloat(item.price);
+        }
       }
-    } else {
-      // 回退到模拟
-      for (const id of tokenIds) {
+    } catch (error) {
+      console.error('Get prices error:', error);
+      // 出错时使用模拟价格
+      for (const id of realTokenIds) {
         prices[id] = this.getSimulatedPrice(id);
       }
     }
@@ -483,25 +521,52 @@ export class PolymarketCLOBClient {
   }
 
   private simulatedPrices: Map<string, number> = new Map([
-    ['btc-yes', 0.5],
-    ['btc-no', 0.5],
+    ['btc-yes', 0.48],
+    ['btc-no', 0.52],
   ]);
+  
+  // 用于模拟快速下跌的状态
+  private lastPriceUpdate: Map<string, number> = new Map();
+  private priceHistory: Map<string, number[]> = new Map();
 
   private getSimulatedPrice(tokenId: string): number {
+    const now = Date.now();
     let price = this.simulatedPrices.get(tokenId) || 0.5;
     
-    // 随机波动
-    const change = (Math.random() - 0.5) * 0.02;
-    price = Math.max(0.01, Math.min(0.99, price + change));
+    // 初始化历史记录
+    if (!this.priceHistory.has(tokenId)) {
+      this.priceHistory.set(tokenId, [price]);
+    }
+    
+    // 偶尔制造快速下跌（约 5% 概率）
+    const shouldDrop = Math.random() < 0.05;
+    if (shouldDrop && tokenId === 'btc-yes') {
+      // 快速下跌 15-25%
+      const dropPct = 0.15 + Math.random() * 0.10;
+      price = price * (1 - dropPct);
+      console.log(`[SIM] Simulated quick drop for ${tokenId}: ${dropPct * 100}% -> ${price.toFixed(4)}`);
+    } else {
+      // 正常波动
+      const change = (Math.random() - 0.5) * 0.02;
+      price = Math.max(0.01, Math.min(0.99, price + change));
+    }
     
     this.simulatedPrices.set(tokenId, price);
+    this.lastPriceUpdate.set(tokenId, now);
     
-    // 同步另一侧价格
+    // 更新历史
+    const history = this.priceHistory.get(tokenId) || [];
+    history.push(price);
+    if (history.length > 10) history.shift();
+    this.priceHistory.set(tokenId, history);
+    
+    // 同步另一侧价格（总和接近 1）
     if (tokenId === 'btc-yes') {
-      const noPrice = Math.max(0.01, Math.min(0.99, 1 - price + (Math.random() - 0.5) * 0.05));
+      // 让 NO 价格也产生一些波动
+      const noPrice = Math.max(0.01, Math.min(0.99, 1 - price + (Math.random() - 0.5) * 0.03));
       this.simulatedPrices.set('btc-no', noPrice);
     } else if (tokenId === 'btc-no') {
-      const yesPrice = Math.max(0.01, Math.min(0.99, 1 - price + (Math.random() - 0.5) * 0.05));
+      const yesPrice = Math.max(0.01, Math.min(0.99, 1 - price + (Math.random() - 0.5) * 0.03));
       this.simulatedPrices.set('btc-yes', yesPrice);
     }
     
