@@ -14,6 +14,17 @@ import { logger } from '@/lib/logger';
 /**
  * 交易策略引擎
  * 核心逻辑：快速下跌对冲套利
+ * 
+ * Leg 1 规则：
+ * - 每轮开始时，启动3分钟倒计时
+ * - 监控YES和NO两侧价格
+ * - 如果任意一侧在3秒内下跌≥15%，立即买入下跌侧
+ * - 3分钟内无信号则结束本轮
+ * 
+ * Leg 2 规则：
+ * - Leg1完成后，监控另一侧价格
+ * - 当 Leg1价格 + 另一侧价格 ≤ 0.93 时，买入另一侧
+ * - 如果在本周期内无法满足条件，放弃本轮
  */
 export class TradingEngine {
   private state: SystemState = {
@@ -27,13 +38,18 @@ export class TradingEngine {
   };
   
   private currentRound?: TradingRound;
-  private roundCheckInterval?: NodeJS.Timeout;
-  private cycleCheckInterval?: NodeJS.Timeout;
+  private mainLoopInterval?: NodeJS.Timeout;
+  private leg1Timeout?: NodeJS.Timeout;
+  private leg2CheckInterval?: NodeJS.Timeout;
   
   // 状态变更回调
   private onStateChange?: (state: SystemState) => void;
   private onRoundUpdate?: (round: TradingRound) => void;
   private onLog?: (log: LogEntry) => void;
+  
+  // 当前市场信息
+  private currentMarketId?: string;
+  private currentMarketQuestion?: string;
   
   /**
    * 初始化引擎
@@ -47,7 +63,6 @@ export class TradingEngine {
     this.onRoundUpdate = onRoundUpdate;
     this.onLog = onLog;
     
-    // 验证配置
     const config = getConfig();
     const validation = validateConfig(config);
     
@@ -55,7 +70,15 @@ export class TradingEngine {
       throw new Error(`Invalid configuration: ${validation.errors.join(', ')}`);
     }
     
-    this.log('INFO', 'ENGINE', 'Trading engine initialized', { config });
+    this.log('INFO', 'ENGINE', '交易引擎初始化完成', { 
+      策略参数: {
+        对冲阈值: config.sumTarget,
+        下跌阈值: `${(config.movePct * 100).toFixed(0)}%`,
+        监控窗口: `${config.windowMin}分钟`,
+        仓位大小: `${config.positionSize} USDC`,
+        最大暴露: `${config.maxExposure} USDC`,
+      }
+    });
   }
   
   /**
@@ -63,7 +86,7 @@ export class TradingEngine {
    */
   async start(): Promise<void> {
     if (this.state.isRunning) {
-      this.log('WARN', 'ENGINE', 'Engine is already running');
+      this.log('WARN', 'ENGINE', '引擎已在运行中');
       return;
     }
     
@@ -71,127 +94,163 @@ export class TradingEngine {
     this.state.lastUpdate = Date.now();
     this.notifyStateChange();
     
-    this.log('INFO', 'ENGINE', 'Trading engine started');
+    this.log('INFO', 'ENGINE', '🚀 交易引擎已启动');
     
-    // 启动周期检查
-    this.startCycleCheck();
+    // 查找市场并启动主循环
+    await this.findMarketAndStartMainLoop();
   }
   
   /**
    * 停止引擎
    */
   async stop(): Promise<void> {
-    if (!this.state.isRunning) {
-      return;
-    }
+    if (!this.state.isRunning) return;
     
     this.state.isRunning = false;
     this.state.lastUpdate = Date.now();
     
-    // 清理定时器
-    if (this.roundCheckInterval) {
-      clearInterval(this.roundCheckInterval);
-      this.roundCheckInterval = undefined;
-    }
-    
-    if (this.cycleCheckInterval) {
-      clearInterval(this.cycleCheckInterval);
-      this.cycleCheckInterval = undefined;
-    }
+    // 清理所有定时器
+    this.clearAllTimers();
     
     // 停止价格监控
     const monitor = getPriceMonitor();
     monitor.stopMonitoring();
     
     // 结束当前轮次
-    if (this.currentRound && this.currentRound.status === 'MONITORING') {
-      await this.failRound('Engine stopped');
+    if (this.currentRound) {
+      await this.endRound('TIMEOUT', '引擎停止');
     }
     
     this.notifyStateChange();
-    this.log('INFO', 'ENGINE', 'Trading engine stopped');
+    this.log('INFO', 'ENGINE', '⏹️ 交易引擎已停止');
   }
   
   /**
-   * 启动周期检查（比特币15分钟市场周期）
+   * 清理所有定时器
    */
-  private startCycleCheck(): void {
-    const config = getConfig();
-    
-    // 每分钟检查一次周期
-    this.cycleCheckInterval = setInterval(async () => {
-      if (!this.state.isRunning) return;
-      
-      // 查找合适的比特币15分钟市场
-      await this.findAndStartRound();
-    }, 60000); // 每分钟检查一次
-    
-    // 立即执行一次
-    this.findAndStartRound();
-  }
-  
-  /**
-   * 查找并启动新的交易轮次
-   */
-  private async findAndStartRound(): Promise<void> {
-    // 如果有正在进行的轮次，跳过
-    if (this.currentRound && this.currentRound.status !== 'COMPLETED' && this.currentRound.status !== 'FAILED' && this.currentRound.status !== 'TIMEOUT') {
-      return;
+  private clearAllTimers(): void {
+    if (this.mainLoopInterval) {
+      clearInterval(this.mainLoopInterval);
+      this.mainLoopInterval = undefined;
     }
-    
+    if (this.leg1Timeout) {
+      clearTimeout(this.leg1Timeout);
+      this.leg1Timeout = undefined;
+    }
+    if (this.leg2CheckInterval) {
+      clearInterval(this.leg2CheckInterval);
+      this.leg2CheckInterval = undefined;
+    }
+  }
+  
+  /**
+   * 查找市场并启动主循环
+   */
+  private async findMarketAndStartMainLoop(): Promise<void> {
     try {
       const client = getPolymarketClient();
-      const response = await client.getMarkets();
+      const response = await client.searchMarkets('bitcoin');
       
       if (!response.success || !response.data || response.data.length === 0) {
-        this.log('WARN', 'ENGINE', 'No suitable markets found');
-        return;
+        this.log('WARN', 'ENGINE', '未找到比特币市场，使用默认市场');
+        this.currentMarketId = 'btc-15min-default';
+        this.currentMarketQuestion = '比特币15分钟涨跌预测';
+      } else {
+        // 筛选高流动性市场
+        const config = getConfig();
+        const suitableMarkets = response.data.filter(market => 
+          market.spread < config.maxSpread && 
+          market.status === 'ACTIVE'
+        );
+        
+        if (suitableMarkets.length > 0) {
+          const market = suitableMarkets[0];
+          this.currentMarketId = market.marketId;
+          this.currentMarketQuestion = market.question;
+          this.log('INFO', 'ENGINE', `已选择市场: ${market.question}`);
+        } else {
+          this.currentMarketId = response.data[0].marketId;
+          this.currentMarketQuestion = response.data[0].question;
+        }
       }
       
-      const config = getConfig();
-      
-      // 筛选高流动性市场
-      const suitableMarkets = response.data.filter(market => 
-        market.spread < config.maxSpread && 
-        market.status === 'ACTIVE'
-      );
-      
-      if (suitableMarkets.length === 0) {
-        this.log('WARN', 'ENGINE', 'No markets with sufficient liquidity');
-        return;
-      }
-      
-      // 选择第一个合适的市场
-      const market = suitableMarkets[0];
-      
-      // 启动新轮次
-      this.startRound(market.marketId, market.question);
+      // 启动主循环（与Polymarket周期同步）
+      this.startSynchronizedMainLoop();
       
     } catch (error) {
-      this.log('ERROR', 'ENGINE', 'Failed to find markets', { error: error instanceof Error ? error.message : 'Unknown error' });
+      this.log('ERROR', 'ENGINE', '查找市场失败', { 
+        error: error instanceof Error ? error.message : 'Unknown error' 
+      });
+      // 使用默认市场
+      this.currentMarketId = 'btc-15min-default';
+      this.currentMarketQuestion = '比特币15分钟涨跌预测';
+      this.startSynchronizedMainLoop();
     }
+  }
+  
+  /**
+   * 启动同步主循环（与Polymarket 15分钟周期同步）
+   */
+  private startSynchronizedMainLoop(): void {
+    const config = getConfig();
+    const cycleDurationMs = config.marketDuration * 60 * 1000; // 15分钟
+    
+    // 计算下一个周期的开始时间
+    const now = Date.now();
+    const currentCycleStart = Math.floor(now / cycleDurationMs) * cycleDurationMs;
+    const nextCycleStart = currentCycleStart + cycleDurationMs;
+    const timeToNextCycle = nextCycleStart - now;
+    
+    this.log('INFO', 'CYCLE', `⏰ 周期同步`, {
+      当前周期开始: new Date(currentCycleStart).toLocaleTimeString(),
+      下个周期开始: new Date(nextCycleStart).toLocaleTimeString(),
+      等待时间: `${Math.floor(timeToNextCycle / 1000)}秒`,
+    });
+    
+    // 立即检查当前周期是否还有时间
+    const remainingInCycle = cycleDurationMs - (now - currentCycleStart);
+    if (remainingInCycle > config.windowMin * 60 * 1000) {
+      // 当前周期还有足够时间，立即开始
+      this.startNewRound(currentCycleStart, nextCycleStart);
+    }
+    
+    // 设置定时器，在每个周期开始时启动新轮次
+    setTimeout(() => {
+      this.startNewRound(nextCycleStart, nextCycleStart + cycleDurationMs);
+      
+      // 每15分钟启动新轮次
+      this.mainLoopInterval = setInterval(() => {
+        const cycleStart = Date.now();
+        this.startNewRound(cycleStart, cycleStart + cycleDurationMs);
+      }, cycleDurationMs);
+      
+    }, timeToNextCycle);
   }
   
   /**
    * 启动新的交易轮次
    */
-  private startRound(marketId: string, marketQuestion: string): void {
+  private startNewRound(cycleStartTime: number, cycleEndTime: number): void {
     const config = getConfig();
     const now = Date.now();
     
-    // 计算周期结束时间（15分钟后）
-    const cycleEndTime = now + config.marketDuration * 60 * 1000;
+    // 如果有正在进行的轮次，先结束
+    if (this.currentRound && 
+        this.currentRound.status !== 'COMPLETED' && 
+        this.currentRound.status !== 'FAILED' && 
+        this.currentRound.status !== 'TIMEOUT') {
+      this.log('WARN', 'ROUND', '上一轮未结束，强制结束');
+      this.endRound('TIMEOUT', '新周期开始');
+    }
     
-    // 计算监控窗口结束时间（3分钟后）
-    const monitoringWindowEnd = now + config.windowMin * 60 * 1000;
-    
+    // 创建新轮次
     this.currentRound = {
       roundId: `round_${now}`,
       startTime: now,
       status: 'MONITORING',
-      marketId,
-      monitoringWindowEnd,
-      cycleEndTime,
+      marketId: this.currentMarketId || 'unknown',
+      monitoringWindowEnd: now + config.windowMin * 60 * 1000, // 3分钟监控窗口
+      cycleEndTime: cycleEndTime,
     };
     
     this.state.totalRounds++;
@@ -199,36 +258,29 @@ export class TradingEngine {
     this.notifyStateChange();
     this.notifyRoundUpdate();
     
-    this.log('INFO', 'ROUND', `Round started: ${marketQuestion}`, {
-      roundId: this.currentRound.roundId,
-      marketId,
-      monitoringWindow: `${config.windowMin} minutes`,
+    this.log('INFO', 'ROUND', `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    this.log('INFO', 'ROUND', `🔄 新轮次开始`, {
+      轮次ID: this.currentRound.roundId,
+      市场: this.currentMarketQuestion,
+      周期结束时间: new Date(cycleEndTime).toLocaleTimeString(),
+      监控窗口: `${config.windowMin}分钟`,
     });
+    this.log('INFO', 'ROUND', `📊 Leg1 监控中... (检测3秒内≥${(config.movePct * 100).toFixed(0)}%下跌)`);
     
     // 启动价格监控
     const monitor = getPriceMonitor();
     monitor.startMonitoring(
-      marketId,
+      this.currentMarketId || 'btc-15min-default',
       (priceData) => this.handlePriceUpdate(priceData),
       (signal) => this.handleDropSignal(signal)
     );
     
-    // 设置监控窗口超时
-    setTimeout(() => {
-      this.checkMonitoringWindow();
+    // 设置Leg1监控窗口超时（3分钟）
+    this.leg1Timeout = setTimeout(() => {
+      if (this.currentRound && this.currentRound.status === 'MONITORING') {
+        this.endRound('TIMEOUT', `📊 Leg1 监控窗口(${config.windowMin}分钟)内未检测到快速下跌信号`);
+      }
     }, config.windowMin * 60 * 1000);
-  }
-  
-  /**
-   * 检查监控窗口是否超时
-   */
-  private checkMonitoringWindow(): void {
-    if (!this.currentRound || this.currentRound.status !== 'MONITORING') {
-      return;
-    }
-    
-    // 如果在监控窗口内没有触发Leg1，结束本轮
-    this.failRound('No signal in monitoring window');
   }
   
   /**
@@ -237,8 +289,33 @@ export class TradingEngine {
   private handlePriceUpdate(priceData: PriceData): void {
     if (!this.currentRound) return;
     
-    // 记录价格更新（用于计算对冲条件）
-    this.log('DEBUG', 'PRICE', `Price update: ${priceData.side} = ${priceData.price.toFixed(4)}`);
+    // Leg1阶段：记录价格用于检测下跌
+    if (this.currentRound.status === 'MONITORING') {
+      // 价格监控在 PriceMonitor 中处理
+    }
+    
+    // Leg2阶段：检查对冲条件
+    if (this.currentRound.status === 'LEG1_EXECUTED' && this.currentRound.leg1) {
+      const monitor = getPriceMonitor();
+      const otherSide: TradeSide = this.currentRound.leg1.side === 'YES' ? 'NO' : 'YES';
+      const otherPrice = monitor.getLatestPrice(otherSide);
+      
+      if (otherPrice !== null) {
+        const sumPrice = this.currentRound.leg1.price + otherPrice;
+        const config = getConfig();
+        
+        // 检查是否满足对冲条件
+        if (sumPrice <= config.sumTarget) {
+          this.log('INFO', 'LEG2', `✅ 满足对冲条件`, {
+            Leg1价格: this.currentRound.leg1.price.toFixed(4),
+            另一侧价格: otherPrice.toFixed(4),
+            价格总和: sumPrice.toFixed(4),
+            目标阈值: config.sumTarget,
+          });
+          this.executeLeg2(otherPrice, otherSide);
+        }
+      }
+    }
   }
   
   /**
@@ -252,15 +329,23 @@ export class TradingEngine {
     // 检查是否在监控窗口内
     const now = Date.now();
     if (now > this.currentRound.monitoringWindowEnd) {
-      this.log('WARN', 'ROUND', 'Signal received outside monitoring window, ignoring');
+      this.log('WARN', 'SIGNAL', '超出监控窗口，信号忽略');
       return;
     }
     
-    this.log('INFO', 'SIGNAL', `Quick drop detected: ${signal.side} dropped ${(signal.dropPct * 100).toFixed(2)}%`, {
-      fromPrice: signal.fromPrice.toFixed(4),
-      toPrice: signal.toPrice.toFixed(4),
-      duration: `${signal.duration}ms`,
+    this.log('INFO', 'SIGNAL', `📉 检测到快速下跌`, {
+      方向: signal.side,
+      下跌幅度: `${(signal.dropPct * 100).toFixed(2)}%`,
+      起始价格: signal.fromPrice.toFixed(4),
+      当前价格: signal.toPrice.toFixed(4),
+      耗时: `${signal.duration}ms`,
     });
+    
+    // 清除Leg1超时定时器
+    if (this.leg1Timeout) {
+      clearTimeout(this.leg1Timeout);
+      this.leg1Timeout = undefined;
+    }
     
     // 执行Leg1
     await this.executeLeg1(signal);
@@ -273,6 +358,13 @@ export class TradingEngine {
     if (!this.currentRound) return;
     
     const config = getConfig();
+    const now = Date.now();
+    
+    this.log('INFO', 'LEG1', `🟢 执行Leg1买入`, {
+      买入方向: signal.side,
+      买入价格: signal.toPrice.toFixed(4),
+      仓位大小: `${config.positionSize} USDC`,
+    });
     
     try {
       const client = getPolymarketClient();
@@ -282,11 +374,11 @@ export class TradingEngine {
         marketId: this.currentRound.marketId,
         side: signal.side,
         amount: config.positionSize,
-        price: signal.toPrice, // 以当前价格买入
+        price: signal.toPrice,
       });
       
       if (!orderResponse.success) {
-        throw new Error(orderResponse.error || 'Order failed');
+        throw new Error(orderResponse.error || '订单失败');
       }
       
       const order = orderResponse.data!;
@@ -297,84 +389,68 @@ export class TradingEngine {
         price: order.executedPrice,
         amount: order.amount,
         timestamp: order.timestamp,
-        triggerReason: `Quick drop: ${(signal.dropPct * 100).toFixed(2)}%`,
+        triggerReason: `快速下跌 ${(signal.dropPct * 100).toFixed(2)}%`,
         priceDrop: signal.dropPct,
       };
       
-      this.currentRound.leg1TriggerTime = order.timestamp;
+      this.currentRound.leg1TriggerTime = now;
       this.currentRound.status = 'LEG1_EXECUTED';
       
       this.notifyRoundUpdate();
       
-      this.log('INFO', 'LEG1', `Leg1 executed: ${signal.side} @ ${order.executedPrice.toFixed(4)}`, {
-        orderId: order.orderId,
-        amount: order.amount,
-        fee: order.fee.toFixed(4),
+      this.log('INFO', 'LEG1', `✅ Leg1 买入成功`, {
+        订单ID: order.orderId,
+        成交价格: order.executedPrice.toFixed(4),
+        成交数量: order.amount,
+        手续费: order.fee.toFixed(4),
       });
       
-      // 开始监控Leg2
-      this.startLeg2Monitoring();
+      // 计算剩余时间
+      const remainingTime = this.currentRound.cycleEndTime - now;
+      const remainingMinutes = Math.floor(remainingTime / 60000);
+      
+      this.log('INFO', 'LEG2', `📊 Leg2 监控中... (等待价格总和≤${config.sumTarget})`, {
+        需要另一侧价格: `≤${(config.sumTarget - order.executedPrice).toFixed(4)}`,
+        剩余时间: `${remainingMinutes}分钟`,
+      });
+      
+      // 设置周期结束检查
+      this.leg2CheckInterval = setInterval(() => {
+        if (!this.currentRound) return;
+        
+        const timeRemaining = this.currentRound.cycleEndTime - Date.now();
+        if (timeRemaining <= 0) {
+          this.endRound('TIMEOUT', '⏰ 周期结束，未满足对冲条件，放弃本轮');
+        }
+      }, 10000); // 每10秒检查一次
       
     } catch (error) {
-      this.log('ERROR', 'LEG1', 'Failed to execute Leg1', { 
+      this.log('ERROR', 'LEG1', `❌ Leg1 买入失败`, { 
         error: error instanceof Error ? error.message : 'Unknown error' 
       });
-      await this.failRound('Leg1 execution failed');
+      await this.endRound('FAILED', 'Leg1执行失败');
     }
-  }
-  
-  /**
-   * 开始Leg2监控
-   */
-  private startLeg2Monitoring(): void {
-    if (!this.currentRound || !this.currentRound.leg1) return;
-    
-    this.log('INFO', 'LEG2', 'Starting Leg2 monitoring', {
-      targetSum: getConfig().sumTarget,
-      leg1Side: this.currentRound.leg1.side,
-      leg1Price: this.currentRound.leg1.price.toFixed(4),
-    });
-    
-    // 设置超时检查（如果接近周期结束，放弃本轮）
-    const timeToCycleEnd = this.currentRound.cycleEndTime - Date.now();
-    
-    setTimeout(() => {
-      if (this.currentRound && this.currentRound.status === 'LEG1_EXECUTED') {
-        this.failRound('No hedge opportunity before cycle end');
-      }
-    }, timeToCycleEnd - 60000); // 提前1分钟放弃
   }
   
   /**
    * 执行Leg2 - 对冲买入
    */
-  private async executeLeg2(): Promise<void> {
+  private async executeLeg2(otherPrice: number, otherSide: TradeSide): Promise<void> {
     if (!this.currentRound || !this.currentRound.leg1) return;
     
     const config = getConfig();
-    const monitor = getPriceMonitor();
+    const now = Date.now();
     
-    // 获取另一侧的价格
-    const otherSide: TradeSide = this.currentRound.leg1.side === 'YES' ? 'NO' : 'YES';
-    const otherPrice = monitor.getLatestPrice(otherSide);
-    
-    if (otherPrice === null) {
-      this.log('WARN', 'LEG2', 'No price data for other side');
-      return;
+    // 清除Leg2检查定时器
+    if (this.leg2CheckInterval) {
+      clearInterval(this.leg2CheckInterval);
+      this.leg2CheckInterval = undefined;
     }
     
-    // 计算价格总和
-    const sumPrice = this.currentRound.leg1.price + otherPrice;
-    
-    // 检查是否满足对冲条件
-    if (sumPrice > config.sumTarget) {
-      this.log('DEBUG', 'LEG2', `Hedge condition not met: sum=${sumPrice.toFixed(4)} > ${config.sumTarget}`);
-      return;
-    }
-    
-    this.log('INFO', 'SIGNAL', `Hedge opportunity detected: sum=${sumPrice.toFixed(4)} <= ${config.sumTarget}`, {
-      leg1Price: this.currentRound.leg1.price.toFixed(4),
-      otherPrice: otherPrice.toFixed(4),
+    this.log('INFO', 'LEG2', `🟢 执行Leg2对冲买入`, {
+      买入方向: otherSide,
+      买入价格: otherPrice.toFixed(4),
+      仓位大小: `${config.positionSize} USDC`,
     });
     
     try {
@@ -389,10 +465,13 @@ export class TradingEngine {
       });
       
       if (!orderResponse.success) {
-        throw new Error(orderResponse.error || 'Order failed');
+        throw new Error(orderResponse.error || '订单失败');
       }
       
       const order = orderResponse.data!;
+      const sumPrice = this.currentRound.leg1.price + order.executedPrice;
+      const grossProfit = (1 - sumPrice) * config.positionSize;
+      const netProfit = grossProfit - order.fee;
       
       // 更新轮次状态
       this.currentRound.leg2 = {
@@ -400,86 +479,93 @@ export class TradingEngine {
         price: order.executedPrice,
         amount: order.amount,
         timestamp: order.timestamp,
-        sumPrice: this.currentRound.leg1.price + order.executedPrice,
+        sumPrice: sumPrice,
         actualFee: order.fee,
       };
       
-      this.currentRound.leg2TriggerTime = order.timestamp;
-      this.currentRound.endTime = order.timestamp;
+      this.currentRound.leg2TriggerTime = now;
+      this.currentRound.endTime = now;
       this.currentRound.status = 'COMPLETED';
       
       // 更新统计
       this.state.successfulRounds++;
-      this.state.totalProfit += this.calculateProfit();
-      this.state.lastUpdate = order.timestamp;
+      this.state.totalProfit += netProfit;
+      this.state.lastUpdate = now;
       
       this.notifyStateChange();
       this.notifyRoundUpdate();
       
-      this.log('INFO', 'LEG2', `Leg2 executed: ${otherSide} @ ${order.executedPrice.toFixed(4)}`, {
-        orderId: order.orderId,
-        amount: order.amount,
-        sumPrice: this.currentRound.leg2.sumPrice.toFixed(4),
-        fee: order.fee.toFixed(4),
+      this.log('INFO', 'LEG2', `✅ Leg2 对冲买入成功`, {
+        订单ID: order.orderId,
+        成交价格: order.executedPrice.toFixed(4),
+        成交数量: order.amount,
+        手续费: order.fee.toFixed(4),
+        价格总和: sumPrice.toFixed(4),
       });
       
-      this.log('INFO', 'ROUND', 'Round completed successfully', {
-        roundId: this.currentRound.roundId,
-        profit: this.calculateProfit().toFixed(4),
+      this.log('INFO', 'ROUND', `🎉 本轮完成！`, {
+        Leg1: `${this.currentRound.leg1.side} @ ${this.currentRound.leg1.price.toFixed(4)}`,
+        Leg2: `${otherSide} @ ${order.executedPrice.toFixed(4)}`,
+        价格总和: sumPrice.toFixed(4),
+        毛利润: grossProfit.toFixed(4),
+        手续费: order.fee.toFixed(4),
+        净利润: netProfit.toFixed(4),
       });
       
-      // 停止监控，准备下一轮
+      // 停止监控
+      const monitor = getPriceMonitor();
       monitor.stopMonitoring();
       
+      // 等待下一周期
+      this.log('INFO', 'ROUND', `⏳ 等待下一周期开始...`);
+      
     } catch (error) {
-      this.log('ERROR', 'LEG2', 'Failed to execute Leg2', { 
+      this.log('ERROR', 'LEG2', `❌ Leg2 买入失败`, { 
         error: error instanceof Error ? error.message : 'Unknown error' 
       });
-      await this.failRound('Leg2 execution failed');
+      await this.endRound('FAILED', 'Leg2执行失败');
     }
   }
   
   /**
-   * 计算利润
+   * 结束轮次
    */
-  private calculateProfit(): number {
-    if (!this.currentRound || !this.currentRound.leg1 || !this.currentRound.leg2) {
-      return 0;
-    }
-    
-    const config = getConfig();
-    
-    // 理论利润 = (1 - sumPrice) * positionSize
-    const sumPrice = this.currentRound.leg1.price + this.currentRound.leg2.price;
-    const grossProfit = (1 - sumPrice) * config.positionSize;
-    
-    // 净利润 = 理论利润 - 手续费
-    const netProfit = grossProfit - this.currentRound.leg2.actualFee;
-    
-    return netProfit;
-  }
-  
-  /**
-   * 结束轮次（失败）
-   */
-  private async failRound(reason: string): Promise<void> {
+  private async endRound(status: 'COMPLETED' | 'FAILED' | 'TIMEOUT', reason: string): Promise<void> {
     if (!this.currentRound) return;
     
-    this.currentRound.status = 'FAILED';
+    // 清理定时器
+    if (this.leg1Timeout) {
+      clearTimeout(this.leg1Timeout);
+      this.leg1Timeout = undefined;
+    }
+    if (this.leg2CheckInterval) {
+      clearInterval(this.leg2CheckInterval);
+      this.leg2CheckInterval = undefined;
+    }
+    
+    // 停止价格监控
+    const monitor = getPriceMonitor();
+    monitor.stopMonitoring();
+    
+    const previousStatus = this.currentRound.status;
+    this.currentRound.status = status;
     this.currentRound.endTime = Date.now();
     this.currentRound.failReason = reason;
     
-    this.state.failedRounds++;
+    if (status !== 'COMPLETED') {
+      this.state.failedRounds++;
+    }
     this.state.lastUpdate = Date.now();
-    
-    const monitor = getPriceMonitor();
-    monitor.stopMonitoring();
     
     this.notifyStateChange();
     this.notifyRoundUpdate();
     
-    this.log('WARN', 'ROUND', `Round failed: ${reason}`, {
-      roundId: this.currentRound.roundId,
+    const statusEmoji = status === 'TIMEOUT' ? '⏰' : status === 'FAILED' ? '❌' : '✅';
+    this.log('INFO', 'ROUND', `${statusEmoji} 轮次结束: ${reason}`, {
+      轮次ID: this.currentRound.roundId,
+      最终状态: status,
+      是否有Leg1: !!this.currentRound.leg1,
+      是否有Leg2: !!this.currentRound.leg2,
     });
   }
   
@@ -512,10 +598,7 @@ export class TradingEngine {
       data,
     };
     
-    // 写入日志文件
     logger.log(logEntry);
-    
-    // 通知前端
     this.onLog?.(logEntry);
   }
   
