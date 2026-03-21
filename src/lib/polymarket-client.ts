@@ -58,7 +58,7 @@ export class PolymarketClient {
       
       // 从 Gamma API 获取最新的比特币15分钟市场
       const response = await fetch(
-        'https://gamma-api.polymarket.com/markets?limit=10&closed=false&active=true',
+        'https://gamma-api.polymarket.com/markets?limit=20&closed=false&active=true',
         {
           method: 'GET',
           headers: {
@@ -74,19 +74,51 @@ export class PolymarketClient {
       
       const markets = await response.json();
       
-      // 找到比特币15分钟市场（UP/DOWN 格式）
-      const btcMarket = markets.find((m: any) => {
+      console.log(`[Market] Found ${markets.length} markets from Gamma API`);
+      
+      // 打印所有市场名称（调试用）
+      markets.forEach((m: any, i: number) => {
+        console.log(`[Market ${i}] ${m.question}`);
+      });
+      
+      // 找到比特币15分钟市场（UP/DOWN 格式）- 放宽条件
+      let btcMarket = markets.find((m: any) => {
         const question = m.question?.toLowerCase() || '';
         return (
-          question.includes('bitcoin') &&
+          (question.includes('bitcoin') || question.includes('btc')) &&
           question.includes('15') &&
           (question.includes('up') || question.includes('down'))
         );
       });
       
+      // 如果没找到，尝试更宽松的条件
       if (!btcMarket) {
+        console.log('[Market] No exact match, trying broader search...');
+        btcMarket = markets.find((m: any) => {
+          const question = m.question?.toLowerCase() || '';
+          return (
+            (question.includes('bitcoin') || question.includes('btc')) &&
+            (question.includes('up') || question.includes('down') || 
+             question.includes('涨') || question.includes('跌'))
+          );
+        });
+      }
+      
+      // 如果还是没找到，尝试任何比特币市场
+      if (!btcMarket) {
+        console.log('[Market] Still no match, trying any Bitcoin market...');
+        btcMarket = markets.find((m: any) => {
+          const question = m.question?.toLowerCase() || '';
+          return question.includes('bitcoin') || question.includes('btc');
+        });
+      }
+      
+      if (!btcMarket) {
+        console.error('[Market] No Bitcoin market found in API response');
         throw new Error('No active Bitcoin 15min market found');
       }
+      
+      console.log(`[Market] Selected: ${btcMarket.question}`);
       
       // 解析市场信息
       const tokens = btcMarket.tokens || [];
