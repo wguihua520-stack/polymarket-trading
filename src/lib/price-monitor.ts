@@ -1,4 +1,4 @@
-import type { PriceData, MarketData, TradeSide } from '@/types/trading';
+import type { PriceData, TradeSide } from '@/types/trading';
 import { getPolymarketClient } from '@/lib/polymarket-client';
 import { getConfig, TIME_CONFIG } from '@/config/strategy';
 
@@ -8,8 +8,8 @@ interface PricePoint {
 }
 
 interface PriceHistory {
-  YES: PricePoint[];
-  NO: PricePoint[];
+  UP: PricePoint[];
+  DOWN: PricePoint[];
 }
 
 interface DropSignal {
@@ -23,23 +23,28 @@ interface DropSignal {
 /**
  * 价格监控服务
  * 负责实时监控价格变化，检测快速下跌信号
+ * 使用真实的 Token ID 从 CLOB API 获取价格
  */
 export class PriceMonitor {
-  private priceHistory: PriceHistory = { YES: [], NO: [] };
-  private maxHistoryLength = 100; // 保存最近100个价格点
+  private priceHistory: PriceHistory = { UP: [], DOWN: [] };
+  private maxHistoryLength = 100;
   private monitorInterval?: NodeJS.Timeout;
   private isMonitoring = false;
-  private currentMarketId?: string;
+  
+  // 当前监控的 Token IDs
+  private upTokenId?: string;
+  private downTokenId?: string;
   
   // 价格变化检测回调
   private onPriceUpdate?: (priceData: PriceData) => void;
   private onDropDetected?: (signal: DropSignal) => void;
   
   /**
-   * 开始监控市场
+   * 使用真实的 Token ID 开始监控
    */
-  startMonitoring(
-    marketId: string,
+  startMonitoringWithTokens(
+    upTokenId: string,
+    downTokenId: string,
     onPriceUpdate: (priceData: PriceData) => void,
     onDropDetected: (signal: DropSignal) => void
   ): void {
@@ -47,26 +52,104 @@ export class PriceMonitor {
       this.stopMonitoring();
     }
     
-    this.currentMarketId = marketId;
+    this.upTokenId = upTokenId;
+    this.downTokenId = downTokenId;
     this.onPriceUpdate = onPriceUpdate;
     this.onDropDetected = onDropDetected;
     this.isMonitoring = true;
     
     // 清空历史数据
-    this.priceHistory = { YES: [], NO: [] };
+    this.priceHistory = { UP: [], DOWN: [] };
     
-    console.log(`[PriceMonitor] Starting monitoring for market: ${marketId}`);
+    console.log(`[PriceMonitor] Starting with tokens:`);
+    console.log(`[PriceMonitor] UP: ${upTokenId.slice(0, 20)}...`);
+    console.log(`[PriceMonitor] DOWN: ${downTokenId.slice(0, 20)}...`);
     
-    // 连接WebSocket
-    const client = getPolymarketClient();
-    client.connectWebSocket(
-      marketId,
-      (priceData) => this.handlePriceUpdate(priceData),
-      (error) => console.error('[PriceMonitor] WebSocket error:', error)
-    );
+    // 启动轮询获取价格
+    this.startPolling();
+  }
+  
+  /**
+   * 开始监控（兼容旧接口）
+   */
+  startMonitoring(
+    marketId: string,
+    onPriceUpdate: (priceData: PriceData) => void,
+    onDropDetected: (signal: DropSignal) => void
+  ): void {
+    console.log('[PriceMonitor] Using legacy monitoring mode - will fetch tokens dynamically');
     
-    // 同时启动轮询作为备用
-    this.startPolling(marketId);
+    // 获取当前活跃市场
+    this.fetchAndStartMonitoring(onPriceUpdate, onDropDetected);
+  }
+  
+  /**
+   * 动态获取 Token ID 并开始监控
+   */
+  private async fetchAndStartMonitoring(
+    onPriceUpdate: (priceData: PriceData) => void,
+    onDropDetected: (signal: DropSignal) => void
+  ): Promise<void> {
+    try {
+      const client = getPolymarketClient();
+      const marketResponse = await client.getActiveBitcoinMarket();
+      
+      if (marketResponse.success && marketResponse.data) {
+        const market = marketResponse.data;
+        this.startMonitoringWithTokens(
+          market.upTokenId,
+          market.downTokenId,
+          onPriceUpdate,
+          onDropDetected
+        );
+      } else {
+        console.error('[PriceMonitor] Failed to get market, using simulation');
+        // 使用模拟数据
+        this.startSimulationMode(onPriceUpdate, onDropDetected);
+      }
+    } catch (error) {
+      console.error('[PriceMonitor] Error fetching market:', error);
+      this.startSimulationMode(onPriceUpdate, onDropDetected);
+    }
+  }
+  
+  /**
+   * 启动模拟模式（无法获取真实数据时）
+   */
+  private startSimulationMode(
+    onPriceUpdate: (priceData: PriceData) => void,
+    onDropDetected: (signal: DropSignal) => void
+  ): void {
+    this.isMonitoring = true;
+    this.onPriceUpdate = onPriceUpdate;
+    this.onDropDetected = onDropDetected;
+    
+    this.priceHistory = { UP: [], DOWN: [] };
+    
+    console.log('[PriceMonitor] Running in simulation mode');
+    
+    // 生成模拟价格
+    this.monitorInterval = setInterval(() => {
+      if (!this.isMonitoring) return;
+      
+      // 生成模拟价格
+      const upPrice = 0.5 + (Math.random() - 0.5) * 0.1;
+      const downPrice = 1 - upPrice + (Math.random() - 0.5) * 0.02;
+      
+      // 更新 UP 价格
+      this.handlePriceUpdate({
+        side: 'YES',
+        price: upPrice,
+        timestamp: Date.now(),
+      });
+      
+      // 更新 DOWN 价格
+      this.handlePriceUpdate({
+        side: 'NO',
+        price: downPrice,
+        timestamp: Date.now(),
+      });
+    }, TIME_CONFIG.PRICE_CHECK_INTERVAL);
   }
   
   /**
@@ -80,40 +163,41 @@ export class PriceMonitor {
       this.monitorInterval = undefined;
     }
     
-    const client = getPolymarketClient();
-    client.disconnectWebSocket();
-    
     console.log('[PriceMonitor] Monitoring stopped');
   }
   
   /**
-   * 启动轮询（作为WebSocket的备用）
+   * 启动轮询获取价格
    */
-  private startPolling(marketId: string): void {
+  private startPolling(): void {
     this.monitorInterval = setInterval(async () => {
-      if (!this.isMonitoring) return;
+      if (!this.isMonitoring || !this.upTokenId || !this.downTokenId) return;
       
       try {
         const client = getPolymarketClient();
-        const response = await client.getMarket(marketId);
         
-        if (response.success && response.data) {
-          const market = response.data;
-          
-          // 更新YES价格
-          this.handlePriceUpdate({
-            side: 'YES',
-            price: market.yesPrice,
-            timestamp: market.timestamp,
-          });
-          
-          // 更新NO价格
-          this.handlePriceUpdate({
-            side: 'NO',
-            price: market.noPrice,
-            timestamp: market.timestamp,
-          });
-        }
+        // 并行获取两个 Token 的价格
+        const [upPrice, downPrice] = await Promise.all([
+          client.getTokenPrice(this.upTokenId),
+          client.getTokenPrice(this.downTokenId),
+        ]);
+        
+        const now = Date.now();
+        
+        // 更新 UP 价格
+        this.handlePriceUpdate({
+          side: 'YES',
+          price: upPrice,
+          timestamp: now,
+        });
+        
+        // 更新 DOWN 价格
+        this.handlePriceUpdate({
+          side: 'NO',
+          price: downPrice,
+          timestamp: now,
+        });
+        
       } catch (error) {
         console.error('[PriceMonitor] Polling error:', error);
       }
@@ -126,28 +210,31 @@ export class PriceMonitor {
   private handlePriceUpdate(priceData: PriceData): void {
     if (!this.isMonitoring) return;
     
+    // 映射 side（YES -> UP, NO -> DOWN）
+    const historyKey: 'UP' | 'DOWN' = priceData.side === 'YES' ? 'UP' : 'DOWN';
+    
     // 添加到历史记录
-    this.priceHistory[priceData.side].push({
+    this.priceHistory[historyKey].push({
       price: priceData.price,
       timestamp: priceData.timestamp,
     });
     
     // 保持历史记录长度
-    if (this.priceHistory[priceData.side].length > this.maxHistoryLength) {
-      this.priceHistory[priceData.side].shift();
+    if (this.priceHistory[historyKey].length > this.maxHistoryLength) {
+      this.priceHistory[historyKey].shift();
     }
     
     // 调用回调
     this.onPriceUpdate?.(priceData);
     
     // 检测快速下跌
-    this.detectQuickDrop(priceData.side);
+    this.detectQuickDrop(historyKey);
   }
   
   /**
    * 检测快速下跌
    */
-  private detectQuickDrop(side: TradeSide): void {
+  private detectQuickDrop(side: 'UP' | 'DOWN'): void {
     const history = this.priceHistory[side];
     
     if (history.length < 2) return;
@@ -170,7 +257,7 @@ export class PriceMonitor {
     // 检查是否超过阈值
     if (dropPct >= config.movePct) {
       const signal: DropSignal = {
-        side,
+        side: side === 'UP' ? 'YES' : 'NO',
         dropPct,
         fromPrice: oldPrice,
         toPrice: currentPrice,
@@ -188,7 +275,8 @@ export class PriceMonitor {
    * 获取最新价格
    */
   getLatestPrice(side: TradeSide): number | null {
-    const history = this.priceHistory[side];
+    const historyKey: 'UP' | 'DOWN' = side === 'YES' ? 'UP' : 'DOWN';
+    const history = this.priceHistory[historyKey];
     return history.length > 0 ? history[history.length - 1].price : null;
   }
   
@@ -196,32 +284,8 @@ export class PriceMonitor {
    * 获取价格历史
    */
   getPriceHistory(side: TradeSide): PricePoint[] {
-    return this.priceHistory[side];
-  }
-  
-  /**
-   * 计算Leg1 + Leg2价格总和
-   */
-  calculateSumPrice(leg1Side: TradeSide, leg1Price: number): number | null {
-    // 获取另一侧的最新价格
-    const otherSide: TradeSide = leg1Side === 'YES' ? 'NO' : 'YES';
-    const otherPrice = this.getLatestPrice(otherSide);
-    
-    if (otherPrice === null) return null;
-    
-    return leg1Price + otherPrice;
-  }
-  
-  /**
-   * 检查是否满足对冲条件
-   */
-  checkHedgeCondition(leg1Side: TradeSide, leg1Price: number): boolean {
-    const sumPrice = this.calculateSumPrice(leg1Side, leg1Price);
-    
-    if (sumPrice === null) return false;
-    
-    const config = getConfig();
-    return sumPrice <= config.sumTarget;
+    const historyKey: 'UP' | 'DOWN' = side === 'YES' ? 'UP' : 'DOWN';
+    return this.priceHistory[historyKey];
   }
 }
 
@@ -234,3 +298,5 @@ export function getPriceMonitor(): PriceMonitor {
   }
   return monitorInstance;
 }
+
+export type { DropSignal };

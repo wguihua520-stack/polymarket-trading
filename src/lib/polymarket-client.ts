@@ -2,6 +2,22 @@ import type { MarketData, PriceData, OrderRequest, OrderResponse, ApiResponse, T
 import { POLYMARKET_CONFIG, getConfig } from '@/config/strategy';
 
 /**
+ * 当前活跃市场信息
+ */
+interface ActiveMarket {
+  conditionId: string;
+  question: string;
+  upTokenId: string;
+  downTokenId: string;
+  endTime: number;
+  startTime: number;
+  prices: {
+    up: number;
+    down: number;
+  };
+}
+
+/**
  * Polymarket API客户端
  * 负责与Polymarket REST API和WebSocket API通信
  */
@@ -12,6 +28,11 @@ export class PolymarketClient {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
   
+  // 当前活跃市场缓存
+  private activeMarket: ActiveMarket | null = null;
+  private marketCacheTime: number = 0;
+  private readonly MARKET_CACHE_TTL = 30000; // 30秒缓存
+  
   constructor() {
     const config = getConfig();
     this.apiKey = config.polymarketApiKey;
@@ -19,13 +40,24 @@ export class PolymarketClient {
   }
   
   /**
-   * 获取比特币15分钟市场 - 直接查询 Gamma API
+   * 获取当前活跃的比特币15分钟市场
+   * 每个市场只有15分钟，需要动态获取最新的
    */
-  async getBitcoin15MinMarket(): Promise<ApiResponse<MarketData>> {
+  async getActiveBitcoinMarket(): Promise<ApiResponse<ActiveMarket>> {
     try {
-      // 使用 Gamma API 搜索比特币15分钟市场
+      const now = Date.now();
+      
+      // 使用缓存（如果还在有效期内）
+      if (this.activeMarket && (now - this.marketCacheTime) < this.MARKET_CACHE_TTL) {
+        // 检查市场是否还有效（至少还有1分钟）
+        if (this.activeMarket.endTime - now > 60000) {
+          return { success: true, data: this.activeMarket };
+        }
+      }
+      
+      // 从 Gamma API 获取最新的比特币15分钟市场
       const response = await fetch(
-        `https://gamma-api.polymarket.com/markets?slug=btc-15m-change&closed=false`,
+        'https://gamma-api.polymarket.com/markets?limit=10&closed=false&active=true',
         {
           method: 'GET',
           headers: {
@@ -36,36 +68,68 @@ export class PolymarketClient {
       );
       
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        throw new Error(`Gamma API error: ${response.status}`);
       }
       
-      const data = await response.json();
+      const markets = await response.json();
       
-      // 取第一个匹配的市场
-      const market = Array.isArray(data) ? data[0] : data;
+      // 找到比特币15分钟市场（UP/DOWN 格式）
+      const btcMarket = markets.find((m: any) => {
+        const question = m.question?.toLowerCase() || '';
+        return (
+          question.includes('bitcoin') &&
+          question.includes('15') &&
+          (question.includes('up') || question.includes('down'))
+        );
+      });
       
-      if (!market) {
-        throw new Error('No Bitcoin 15min market found');
+      if (!btcMarket) {
+        throw new Error('No active Bitcoin 15min market found');
       }
       
-      const parsed = this.parseMarketData(market);
+      // 解析市场信息
+      const tokens = btcMarket.tokens || [];
+      const upToken = tokens.find((t: any) => t.outcome?.toUpperCase() === 'UP');
+      const downToken = tokens.find((t: any) => t.outcome?.toUpperCase() === 'DOWN');
       
-      if (!parsed) {
-        throw new Error('Failed to parse market data');
+      if (!upToken || !downToken) {
+        throw new Error('Market tokens not found');
       }
       
-      // 获取真实的 Token IDs
-      if (market.tokens) {
-        const upToken = market.tokens.find((t: any) => t.outcome?.toUpperCase() === 'UP');
-        const downToken = market.tokens.find((t: any) => t.outcome?.toUpperCase() === 'DOWN');
-        
-        if (upToken) (parsed as any).upTokenId = upToken.token_id;
-        if (downToken) (parsed as any).downTokenId = downToken.token_id;
-      }
+      // 获取实时价格（从订单簿）
+      const [upPrice, downPrice] = await Promise.all([
+        this.getTokenPrice(upToken.token_id),
+        this.getTokenPrice(downToken.token_id),
+      ]);
       
-      return { success: true, data: parsed };
+      // 解析市场时间
+      const startTime = btcMarket.start_date_iso ? new Date(btcMarket.start_date_iso).getTime() : now;
+      const endTime = btcMarket.end_date_iso ? new Date(btcMarket.end_date_iso).getTime() : now + 15 * 60 * 1000;
+      
+      this.activeMarket = {
+        conditionId: btcMarket.condition_id,
+        question: btcMarket.question,
+        upTokenId: upToken.token_id,
+        downTokenId: downToken.token_id,
+        startTime,
+        endTime,
+        prices: {
+          up: upPrice,
+          down: downPrice,
+        },
+      };
+      
+      this.marketCacheTime = now;
+      
+      console.log(`[Market] Active market: ${btcMarket.question}`);
+      console.log(`[Market] UP Token: ${upToken.token_id}`);
+      console.log(`[Market] DOWN Token: ${downToken.token_id}`);
+      console.log(`[Market] Prices: UP=${upPrice.toFixed(4)}, DOWN=${downPrice.toFixed(4)}`);
+      
+      return { success: true, data: this.activeMarket };
+      
     } catch (error) {
-      console.error('Failed to fetch Bitcoin 15min market:', error);
+      console.error('Failed to get active market:', error);
       return { 
         success: false, 
         error: error instanceof Error ? error.message : 'Unknown error' 
@@ -74,13 +138,49 @@ export class PolymarketClient {
   }
   
   /**
-   * 获取市场列表 - 使用 Gamma API
+   * 从 CLOB API 获取 Token 实时价格
+   */
+  async getTokenPrice(tokenId: string): Promise<number> {
+    try {
+      const response = await fetch(
+        `https://clob.polymarket.com/book?token_id=${tokenId}`,
+        {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          cache: 'no-store',
+        }
+      );
+      
+      if (!response.ok) {
+        return 0.5;
+      }
+      
+      const data = await response.json();
+      
+      // 从订单簿获取中间价
+      const bestBid = data.bids?.[0]?.price ? parseFloat(data.bids[0].price) : null;
+      const bestAsk = data.asks?.[0]?.price ? parseFloat(data.asks[0].price) : null;
+      
+      if (bestBid !== null && bestAsk !== null) {
+        return (bestBid + bestAsk) / 2;
+      }
+      
+      return 0.5;
+    } catch (error) {
+      console.error('Get token price error:', error);
+      return 0.5;
+    }
+  }
+  
+  /**
+   * 获取市场列表
    */
   async getMarkets(): Promise<ApiResponse<MarketData[]>> {
     try {
-      // 使用 Gamma API 获取活跃市场
       const response = await fetch(
-        `https://gamma-api.polymarket.com/markets?limit=50&closed=false`,
+        'https://gamma-api.polymarket.com/markets?limit=50&closed=false',
         {
           method: 'GET',
           headers: {
@@ -96,11 +196,6 @@ export class PolymarketClient {
       
       const data = await response.json();
       
-      if (!Array.isArray(data)) {
-        throw new Error('Invalid response format');
-      }
-      
-      // 解析所有市场
       const markets: MarketData[] = data
         .filter((market: any) => market.active !== false)
         .map((market: any) => this.parseMarketData(market))
@@ -122,7 +217,7 @@ export class PolymarketClient {
   async searchMarkets(query: string): Promise<ApiResponse<MarketData[]>> {
     try {
       const response = await fetch(
-        `https://gamma-api.polymarket.com/markets?limit=50&closed=false`,
+        'https://gamma-api.polymarket.com/markets?limit=50&closed=false',
         {
           method: 'GET',
           headers: {
@@ -137,10 +232,6 @@ export class PolymarketClient {
       }
       
       const data = await response.json();
-      
-      if (!Array.isArray(data)) {
-        throw new Error('Invalid response format');
-      }
       
       const queryLower = query.toLowerCase();
       
@@ -164,74 +255,6 @@ export class PolymarketClient {
   }
   
   /**
-   * 获取单个市场数据
-   */
-  async getMarket(marketId: string): Promise<ApiResponse<MarketData>> {
-    try {
-      const response = await fetch(
-        `https://gamma-api.polymarket.com/markets/${marketId}`,
-        {
-          method: 'GET',
-          headers: {
-            'Accept': 'application/json',
-          },
-          cache: 'no-store',
-        }
-      );
-      
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      
-      const data = await response.json();
-      const market = this.parseMarketData(data);
-      
-      if (!market) {
-        throw new Error('Failed to parse market data');
-      }
-      
-      return { success: true, data: market };
-    } catch (error) {
-      console.error('Failed to fetch market:', error);
-      return { 
-        success: false, 
-        error: error instanceof Error ? error.message : 'Unknown error' 
-      };
-    }
-  }
-  
-  /**
-   * 获取订单簿
-   */
-  async getOrderBook(tokenId: string): Promise<ApiResponse<any>> {
-    try {
-      const response = await fetch(
-        `${POLYMARKET_CONFIG.REST_API_URL}/book?token_id=${tokenId}`,
-        {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        }
-      );
-      
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      
-      const data = await response.json();
-      
-      return { success: true, data };
-    } catch (error) {
-      console.error('Failed to fetch order book:', error);
-      return { 
-        success: false, 
-        error: error instanceof Error ? error.message : 'Unknown error' 
-      };
-    }
-  }
-  
-  /**
    * 创建订单
    */
   async createOrder(orderRequest: OrderRequest): Promise<ApiResponse<OrderResponse>> {
@@ -242,12 +265,13 @@ export class PolymarketClient {
       
       console.log('Creating order:', orderRequest);
       
+      // TODO: 实现真实订单创建
       const mockResponse: OrderResponse = {
         orderId: `order_${Date.now()}`,
         marketId: orderRequest.marketId,
         side: orderRequest.side,
         amount: orderRequest.amount,
-        executedPrice: orderRequest.side === 'YES' ? 0.35 : 0.65,
+        executedPrice: orderRequest.price,
         fee: orderRequest.amount * 0.0156,
         timestamp: Date.now(),
       };
@@ -263,183 +287,51 @@ export class PolymarketClient {
   }
   
   /**
-   * 连接WebSocket获取实时价格
-   */
-  connectWebSocket(
-    marketId: string,
-    onPriceUpdate: (priceData: PriceData) => void,
-    onError?: (error: Error) => void
-  ): void {
-    try {
-      if (this.ws) {
-        this.ws.close();
-      }
-      
-      this.ws = new WebSocket(POLYMARKET_CONFIG.WS_API_URL);
-      
-      this.ws.onopen = () => {
-        console.log('WebSocket connected');
-        this.reconnectAttempts = 0;
-        
-        this.ws?.send(JSON.stringify({
-          type: 'subscribe',
-          channel: 'market',
-          marketId: marketId,
-        }));
-      };
-      
-      this.ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          
-          if (data.type === 'price_update') {
-            const priceData: PriceData = {
-              side: data.side,
-              price: data.price,
-              timestamp: Date.now(),
-            };
-            onPriceUpdate(priceData);
-          }
-        } catch (error) {
-          console.error('Failed to parse WebSocket message:', error);
-        }
-      };
-      
-      this.ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
-        onError?.(new Error('WebSocket error'));
-      };
-      
-      this.ws.onclose = () => {
-        console.log('WebSocket disconnected');
-        
-        if (this.reconnectAttempts < this.maxReconnectAttempts) {
-          this.reconnectAttempts++;
-          setTimeout(() => {
-            this.connectWebSocket(marketId, onPriceUpdate, onError);
-          }, 5000 * this.reconnectAttempts);
-        }
-      };
-    } catch (error) {
-      console.error('Failed to connect WebSocket:', error);
-      onError?.(error instanceof Error ? error : new Error('Unknown error'));
-    }
-  }
-  
-  /**
-   * 断开WebSocket连接
-   */
-  disconnectWebSocket(): void {
-    if (this.ws) {
-      this.ws.close();
-      this.ws = undefined;
-    }
-  }
-  
-  /**
-   * 解析市场数据 - 支持 YES/NO 和 UP/DOWN 格式
+   * 解析市场数据
    */
   private parseMarketData(market: any): MarketData | null {
     try {
       if (!market) return null;
       
-      // 获取 tokens 数据
       const tokens = market.tokens || [];
       
-      // 尝试找到 UP 和 DOWN token (Bitcoin 15分钟市场格式)
-      let upToken = tokens.find((t: any) => 
-        t.outcome?.toUpperCase() === 'UP'
-      );
-      let downToken = tokens.find((t: any) => 
-        t.outcome?.toUpperCase() === 'DOWN'
-      );
+      // 优先查找 UP/DOWN token
+      let upToken = tokens.find((t: any) => t.outcome?.toUpperCase() === 'UP');
+      let downToken = tokens.find((t: any) => t.outcome?.toUpperCase() === 'DOWN');
       
-      // 如果找到了 UP/DOWN，使用它们
-      if (upToken && downToken) {
-        const upPrice = this.extractPrice(upToken);
-        const downPrice = this.extractPrice(downToken);
-        const spread = Math.abs(1 - (upPrice + downPrice));
-        
-        console.log(`[Market Parser] UP/DOWN market found: ${market.question}`);
-        console.log(`[Market Parser] UP: ${upPrice.toFixed(4)}, DOWN: ${downPrice.toFixed(4)}, Spread: ${(spread * 100).toFixed(2)}%`);
-        
-        return {
-          marketId: market.condition_id || market.id || '',
-          question: market.question || 'Unknown',
-          yesPrice: upPrice,  // YES = UP
-          noPrice: downPrice, // NO = DOWN
-          yesBestAsk: upToken?.price?.bestAsk ? parseFloat(upToken.price.bestAsk) : upPrice,
-          noBestAsk: downToken?.price?.bestAsk ? parseFloat(downToken.price.bestAsk) : downPrice,
-          yesBestBid: upToken?.price?.bestBid ? parseFloat(upToken.price.bestBid) : upPrice,
-          noBestBid: downToken?.price?.bestBid ? parseFloat(downToken.price.bestBid) : downPrice,
-          spread,
-          liquidity: parseFloat(market.volume || market.liquidity || '0') || 0,
-          status: market.closed ? 'SETTLED' : (market.active !== false ? 'ACTIVE' : 'INACTIVE'),
-          timestamp: Date.now(),
-        };
+      // 如果没有找到，查找 YES/NO
+      if (!upToken || !downToken) {
+        upToken = tokens.find((t: any) => t.outcome?.toUpperCase() === 'YES');
+        downToken = tokens.find((t: any) => t.outcome?.toUpperCase() === 'NO');
       }
       
-      // 尝试找到 YES 和 NO token
-      let yesToken = tokens.find((t: any) => 
-        t.outcome?.toUpperCase() === 'YES'
-      );
-      let noToken = tokens.find((t: any) => 
-        t.outcome?.toUpperCase() === 'NO'
-      );
-      
-      // 如果找到了 YES/NO，使用它们
-      if (yesToken && noToken) {
-        const yesPrice = this.extractPrice(yesToken);
-        const noPrice = this.extractPrice(noToken);
-        const spread = Math.abs(1 - (yesPrice + noPrice));
-        
-        console.log(`[Market Parser] YES/NO market found: ${market.question}`);
-        
-        return {
-          marketId: market.condition_id || market.id || '',
-          question: market.question || 'Unknown',
-          yesPrice,
-          noPrice,
-          yesBestAsk: yesToken?.price?.bestAsk ? parseFloat(yesToken.price.bestAsk) : yesPrice,
-          noBestAsk: noToken?.price?.bestAsk ? parseFloat(noToken.price.bestAsk) : noPrice,
-          yesBestBid: yesToken?.price?.bestBid ? parseFloat(yesToken.price.bestBid) : yesPrice,
-          noBestBid: noToken?.price?.bestBid ? parseFloat(noToken.price.bestBid) : noPrice,
-          spread,
-          liquidity: parseFloat(market.volume || market.liquidity || '0') || 0,
-          status: market.closed ? 'SETTLED' : (market.active !== false ? 'ACTIVE' : 'INACTIVE'),
-          timestamp: Date.now(),
-        };
+      // 如果还没有，使用前两个 token
+      if (!upToken && !downToken && tokens.length >= 2) {
+        upToken = tokens[0];
+        downToken = tokens[1];
       }
       
-      // 如果没有找到标准格式，使用前两个 token
-      if (tokens.length >= 2) {
-        const firstToken = tokens[0];
-        const secondToken = tokens[1];
-        
-        const firstPrice = this.extractPrice(firstToken);
-        const secondPrice = this.extractPrice(secondToken);
-        const spread = Math.abs(1 - (firstPrice + secondPrice));
-        
-        console.log(`[Market Parser] Using first two tokens: ${firstToken.outcome}, ${secondToken.outcome}`);
-        
-        return {
-          marketId: market.condition_id || market.id || '',
-          question: market.question || 'Unknown',
-          yesPrice: firstPrice,
-          noPrice: secondPrice,
-          yesBestAsk: firstToken?.price?.bestAsk ? parseFloat(firstToken.price.bestAsk) : firstPrice,
-          noBestAsk: secondToken?.price?.bestAsk ? parseFloat(secondToken.price.bestAsk) : secondPrice,
-          yesBestBid: firstToken?.price?.bestBid ? parseFloat(firstToken.price.bestBid) : firstPrice,
-          noBestBid: secondToken?.price?.bestBid ? parseFloat(secondToken.price.bestBid) : secondPrice,
-          spread,
-          liquidity: parseFloat(market.volume || market.liquidity || '0') || 0,
-          status: market.closed ? 'SETTLED' : (market.active !== false ? 'ACTIVE' : 'INACTIVE'),
-          timestamp: Date.now(),
-        };
-      }
+      const upPrice = this.extractPrice(upToken);
+      const downPrice = this.extractPrice(downToken);
+      const spread = Math.abs(1 - (upPrice + downPrice));
       
-      console.error('[Market Parser] No valid tokens found');
-      return null;
+      return {
+        marketId: market.condition_id || market.id || '',
+        question: market.question || 'Unknown',
+        yesPrice: upPrice,
+        noPrice: downPrice,
+        yesBestAsk: upToken?.price?.bestAsk ? parseFloat(upToken.price.bestAsk) : upPrice,
+        noBestAsk: downToken?.price?.bestAsk ? parseFloat(downToken.price.bestAsk) : downPrice,
+        yesBestBid: upToken?.price?.bestBid ? parseFloat(upToken.price.bestBid) : upPrice,
+        noBestBid: downToken?.price?.bestBid ? parseFloat(downToken.price.bestBid) : downPrice,
+        spread,
+        liquidity: parseFloat(market.volume || market.liquidity || '0') || 0,
+        status: market.closed ? 'SETTLED' : (market.active !== false ? 'ACTIVE' : 'INACTIVE'),
+        timestamp: Date.now(),
+        // 额外字段
+        upTokenId: upToken?.token_id,
+        downTokenId: downToken?.token_id,
+      } as MarketData & { upTokenId?: string; downTokenId?: string };
     } catch (error) {
       console.error('Failed to parse market:', error);
       return null;
@@ -452,13 +344,11 @@ export class PolymarketClient {
   private extractPrice(token: any): number {
     if (!token) return 0.5;
     
-    // 尝试多种价格字段
     const price = token.price;
     
     if (typeof price === 'number') return price;
     if (typeof price === 'string') return parseFloat(price) || 0.5;
     if (typeof price === 'object') {
-      // 优先使用 bestAsk (买入价格)
       if (price.bestAsk) return parseFloat(price.bestAsk) || 0.5;
       if (price.price) return parseFloat(price.price) || 0.5;
       if (price.bestBid) return parseFloat(price.bestBid) || 0.5;
@@ -477,3 +367,5 @@ export function getPolymarketClient(): PolymarketClient {
   }
   return clientInstance;
 }
+
+export type { ActiveMarket };

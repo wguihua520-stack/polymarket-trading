@@ -144,108 +144,121 @@ export class TradingEngine {
   }
   
   /**
-   * 查找市场并启动主循环
+   * 查找当前活跃的比特币15分钟市场并启动主循环
    */
   private async findMarketAndStartMainLoop(): Promise<void> {
     try {
-      // 查找比特币15分钟市场
-      const btcResponse = await client.getBitcoin15MinMarket();
+      const client = getPolymarketClient();
+      const marketResponse = await client.getActiveBitcoinMarket();
       
-      if (btcResponse.success && btcResponse.data) {
-        this.currentMarketId = btcResponse.data.marketId;
-        this.currentMarketQuestion = btcResponse.data.question;
-        this.log('INFO', 'ENGINE', `已选择市场: ${btcResponse.data.question}`, {
-          UP价格: btcResponse.data.yesPrice.toFixed(4),
-          DOWN价格: btcResponse.data.noPrice.toFixed(4),
-          价差: `${(btcResponse.data.spread * 100).toFixed(2)}%`,
-        });
-      } else {
-        // 尝试搜索市场
-        const response = await client.searchMarkets('bitcoin');
+      if (marketResponse.success && marketResponse.data) {
+        const market = marketResponse.data;
+        this.currentMarketId = market.conditionId;
+        this.currentMarketQuestion = market.question;
         
-        if (!response.success || !response.data || response.data.length === 0) {
-          this.log('WARN', 'ENGINE', '未找到比特币市场，使用默认市场');
-          this.currentMarketId = 'btc-15min-default';
-          this.currentMarketQuestion = '比特币15分钟涨跌预测';
-        } else {
-          // 筛选高流动性市场
-          const config = getConfig();
-          const suitableMarkets = response.data.filter(market => 
-            market.spread < config.maxSpread && 
-            market.status === 'ACTIVE'
-          );
-          
-          if (suitableMarkets.length > 0) {
-            const market = suitableMarkets[0];
-            this.currentMarketId = market.marketId;
-            this.currentMarketQuestion = market.question;
-            this.log('INFO', 'ENGINE', `已选择市场: ${market.question}`);
-          } else {
-            this.currentMarketId = response.data[0].marketId;
-            this.currentMarketQuestion = response.data[0].question;
+        this.log('INFO', 'ENGINE', `✅ 找到活跃市场`, {
+          市场: market.question,
+          UP价格: market.prices.up.toFixed(4),
+          DOWN价格: market.prices.down.toFixed(4),
+          结束时间: new Date(market.endTime).toLocaleTimeString(),
+          UP_Token: `${market.upTokenId.slice(0, 10)}...`,
+          DOWN_Token: `${market.downTokenId.slice(0, 10)}...`,
+        });
+        
+        // 启动主循环（根据市场结束时间同步）
+        this.startSynchronizedMainLoop(market);
+      } else {
+        this.log('WARN', 'ENGINE', '未找到活跃的比特币15分钟市场，稍后重试');
+        
+        // 5秒后重试
+        setTimeout(() => {
+          if (this.state.isRunning) {
+            this.findMarketAndStartMainLoop();
           }
-        }
+        }, 5000);
       }
-      
-      // 启动主循环（与Polymarket周期同步）
-      this.startSynchronizedMainLoop();
-      
     } catch (error) {
       this.log('ERROR', 'ENGINE', '查找市场失败', { 
         error: error instanceof Error ? error.message : 'Unknown error' 
       });
-      // 使用默认市场
-      this.currentMarketId = 'btc-15min-default';
-      this.currentMarketQuestion = '比特币15分钟涨跌预测';
-      this.startSynchronizedMainLoop();
+      
+      // 5秒后重试
+      setTimeout(() => {
+        if (this.state.isRunning) {
+          this.findMarketAndStartMainLoop();
+        }
+      }, 5000);
     }
   }
   
   /**
-   * 启动同步主循环（与Polymarket 15分钟周期同步）
+   * 启动同步主循环（与Polymarket 15分钟市场同步）
    */
-  private startSynchronizedMainLoop(): void {
+  private startSynchronizedMainLoop(market: {
+    conditionId: string;
+    question: string;
+    endTime: number;
+    upTokenId: string;
+    downTokenId: string;
+  }): void {
     const config = getConfig();
-    const cycleDurationMs = config.marketDuration * 60 * 1000; // 15分钟
-    
-    // 计算下一个周期的开始时间
     const now = Date.now();
-    const currentCycleStart = Math.floor(now / cycleDurationMs) * cycleDurationMs;
-    const nextCycleStart = currentCycleStart + cycleDurationMs;
-    const timeToNextCycle = nextCycleStart - now;
     
-    this.log('INFO', 'CYCLE', `⏰ 周期同步`, {
-      当前周期开始: new Date(currentCycleStart).toLocaleTimeString(),
-      下个周期开始: new Date(nextCycleStart).toLocaleTimeString(),
-      等待时间: `${Math.floor(timeToNextCycle / 1000)}秒`,
+    // 使用市场的实际结束时间
+    const cycleEndTime = market.endTime;
+    const remainingMs = cycleEndTime - now;
+    
+    this.log('INFO', 'CYCLE', `⏰ 市场周期`, {
+      市场: market.question,
+      剩余时间: `${Math.floor(remainingMs / 60000)}分${Math.floor((remainingMs % 60000) / 1000)}秒`,
+      结束时间: new Date(cycleEndTime).toLocaleTimeString(),
     });
     
-    // 立即检查当前周期是否还有时间
-    const remainingInCycle = cycleDurationMs - (now - currentCycleStart);
-    if (remainingInCycle > config.windowMin * 60 * 1000) {
-      // 当前周期还有足够时间，立即开始
-      this.startNewRound(currentCycleStart, nextCycleStart);
+    // 如果还有足够时间（至少监控窗口时间），立即开始
+    if (remainingMs > config.windowMin * 60 * 1000) {
+      this.startNewRound(market);
+    } else {
+      this.log('WARN', 'CYCLE', '当前市场剩余时间不足，等待下一个市场');
     }
     
-    // 设置定时器，在每个周期开始时启动新轮次
-    setTimeout(() => {
-      this.startNewRound(nextCycleStart, nextCycleStart + cycleDurationMs);
+    // 设置定时器，在市场结束时查找下一个市场
+    const timeToNextMarket = Math.max(remainingMs + 5000, 10000); // 市场结束后5秒，或最少10秒
+    
+    this.mainLoopInterval = setInterval(async () => {
+      if (!this.state.isRunning) return;
       
-      // 每15分钟启动新轮次
-      this.mainLoopInterval = setInterval(() => {
-        const cycleStart = Date.now();
-        this.startNewRound(cycleStart, cycleStart + cycleDurationMs);
-      }, cycleDurationMs);
+      // 市场结束，查找下一个市场
+      this.log('INFO', 'CYCLE', '🔄 市场周期结束，查找下一个市场...');
       
-    }, timeToNextCycle);
+      // 如果当前轮次还在进行，先结束它
+      if (this.currentRound && 
+          this.currentRound.status !== 'COMPLETED' && 
+          this.currentRound.status !== 'FAILED' && 
+          this.currentRound.status !== 'TIMEOUT') {
+        await this.endRound('TIMEOUT', '市场周期结束');
+      }
+      
+      // 查找新的市场
+      await this.findMarketAndStartMainLoop();
+    }, timeToNextMarket);
   }
   
   /**
    * 启动新的交易轮次
    */
-  private startNewRound(cycleStartTime: number, cycleEndTime: number): void {
+  private startNewRound(market: {
+    conditionId: string;
+    question: string;
+    endTime: number;
+    upTokenId: string;
+    downTokenId: string;
+  }): void {
     const config = getConfig();
     const now = Date.now();
+    
+    // 更新当前市场信息
+    this.currentMarketId = market.conditionId;
+    this.currentMarketQuestion = market.question;
     
     // 如果有正在进行的轮次，先结束
     if (this.currentRound && 
@@ -261,9 +274,9 @@ export class TradingEngine {
       roundId: `round_${now}`,
       startTime: now,
       status: 'MONITORING',
-      marketId: this.currentMarketId || 'unknown',
+      marketId: market.conditionId,
       monitoringWindowEnd: now + config.windowMin * 60 * 1000, // 3分钟监控窗口
-      cycleEndTime: cycleEndTime,
+      cycleEndTime: market.endTime,
     };
     
     this.state.totalRounds++;
@@ -274,16 +287,19 @@ export class TradingEngine {
     this.log('INFO', 'ROUND', `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
     this.log('INFO', 'ROUND', `🔄 新轮次开始`, {
       轮次ID: this.currentRound.roundId,
-      市场: this.currentMarketQuestion,
-      周期结束时间: new Date(cycleEndTime).toLocaleTimeString(),
+      市场: market.question,
+      周期结束时间: new Date(market.endTime).toLocaleTimeString(),
       监控窗口: `${config.windowMin}分钟`,
+      UP_Token: `${market.upTokenId.slice(0, 16)}...`,
+      DOWN_Token: `${market.downTokenId.slice(0, 16)}...`,
     });
     this.log('INFO', 'ROUND', `📊 Leg1 监控中... (检测3秒内≥${(config.movePct * 100).toFixed(0)}%下跌)`);
     
-    // 启动价格监控
+    // 启动价格监控（使用真实的 Token ID）
     const monitor = getPriceMonitor();
-    monitor.startMonitoring(
-      this.currentMarketId || 'btc-15min-default',
+    monitor.startMonitoringWithTokens(
+      market.upTokenId,
+      market.downTokenId,
       (priceData) => this.handlePriceUpdate(priceData),
       (signal) => this.handleDropSignal(signal)
     );
