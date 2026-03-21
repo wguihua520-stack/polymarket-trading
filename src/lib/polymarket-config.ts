@@ -41,14 +41,16 @@ export async function checkApiConnectivity(): Promise<{
   
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), POLYMARKET_CONFIG.HEALTH_CHECK_TIMEOUT);
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
     
-    const response = await fetch(`${POLYMARKET_CONFIG.CLOB_API_URL}/server_time`, {
+    // 使用 Gamma API 检测连接（更稳定）
+    const response = await fetch('https://gamma-api.polymarket.com/markets?limit=1', {
       method: 'GET',
       signal: controller.signal,
       headers: {
         'Accept': 'application/json',
       },
+      cache: 'no-store',
     });
     
     clearTimeout(timeoutId);
@@ -64,6 +66,7 @@ export async function checkApiConnectivity(): Promise<{
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error('[API Check] Error:', errorMessage);
     return { 
       reachable: false, 
       error: errorMessage 
