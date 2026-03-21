@@ -19,6 +19,52 @@ export class PolymarketClient {
   }
   
   /**
+   * 获取比特币15分钟市场 - 直接查询 Gamma API
+   */
+  async getBitcoin15MinMarket(): Promise<ApiResponse<MarketData>> {
+    try {
+      // 使用 Gamma API 搜索比特币15分钟市场
+      const response = await fetch(
+        `https://gamma-api.polymarket.com/markets?slug=btc-15m-change&closed=false`,
+        {
+          method: 'GET',
+          headers: {
+            'Accept': 'application/json',
+          },
+          cache: 'no-store',
+        }
+      );
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      
+      // 取第一个匹配的市场
+      const market = Array.isArray(data) ? data[0] : data;
+      
+      if (!market) {
+        throw new Error('No Bitcoin 15min market found');
+      }
+      
+      const parsed = this.parseMarketData(market);
+      
+      if (!parsed) {
+        throw new Error('Failed to parse market data');
+      }
+      
+      return { success: true, data: parsed };
+    } catch (error) {
+      console.error('Failed to fetch Bitcoin 15min market:', error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'Unknown error' 
+      };
+    }
+  }
+  
+  /**
    * 获取市场列表 - 使用 Gamma API
    */
   async getMarkets(): Promise<ApiResponse<MarketData[]>> {
@@ -282,7 +328,7 @@ export class PolymarketClient {
   }
   
   /**
-   * 解析市场数据
+   * 解析市场数据 - 支持 YES/NO 和 UP/DOWN 格式
    */
   private parseMarketData(market: any): MarketData | null {
     try {
@@ -291,41 +337,100 @@ export class PolymarketClient {
       // 获取 tokens 数据
       const tokens = market.tokens || [];
       
-      // 尝试找到 YES 和 NO token
-      let yesToken = tokens.find((t: any) => 
-        t.outcome?.toUpperCase() === 'YES' || t.outcome === 'Yes'
+      // 尝试找到 UP 和 DOWN token (Bitcoin 15分钟市场格式)
+      let upToken = tokens.find((t: any) => 
+        t.outcome?.toUpperCase() === 'UP'
       );
-      let noToken = tokens.find((t: any) => 
-        t.outcome?.toUpperCase() === 'NO' || t.outcome === 'No'
+      let downToken = tokens.find((t: any) => 
+        t.outcome?.toUpperCase() === 'DOWN'
       );
       
-      // 如果没有找到标准格式，使用前两个 token
-      if (!yesToken && tokens.length >= 2) {
-        yesToken = tokens[0];
-        noToken = tokens[1];
+      // 如果找到了 UP/DOWN，使用它们
+      if (upToken && downToken) {
+        const upPrice = this.extractPrice(upToken);
+        const downPrice = this.extractPrice(downToken);
+        const spread = Math.abs(1 - (upPrice + downPrice));
+        
+        console.log(`[Market Parser] UP/DOWN market found: ${market.question}`);
+        console.log(`[Market Parser] UP: ${upPrice.toFixed(4)}, DOWN: ${downPrice.toFixed(4)}, Spread: ${(spread * 100).toFixed(2)}%`);
+        
+        return {
+          marketId: market.condition_id || market.id || '',
+          question: market.question || 'Unknown',
+          yesPrice: upPrice,  // YES = UP
+          noPrice: downPrice, // NO = DOWN
+          yesBestAsk: upToken?.price?.bestAsk ? parseFloat(upToken.price.bestAsk) : upPrice,
+          noBestAsk: downToken?.price?.bestAsk ? parseFloat(downToken.price.bestAsk) : downPrice,
+          yesBestBid: upToken?.price?.bestBid ? parseFloat(upToken.price.bestBid) : upPrice,
+          noBestBid: downToken?.price?.bestBid ? parseFloat(downToken.price.bestBid) : downPrice,
+          spread,
+          liquidity: parseFloat(market.volume || market.liquidity || '0') || 0,
+          status: market.closed ? 'SETTLED' : (market.active !== false ? 'ACTIVE' : 'INACTIVE'),
+          timestamp: Date.now(),
+        };
       }
       
-      // 获取价格
-      const yesPrice = this.extractPrice(yesToken);
-      const noPrice = this.extractPrice(noToken);
+      // 尝试找到 YES 和 NO token
+      let yesToken = tokens.find((t: any) => 
+        t.outcome?.toUpperCase() === 'YES'
+      );
+      let noToken = tokens.find((t: any) => 
+        t.outcome?.toUpperCase() === 'NO'
+      );
       
-      // 计算价差
-      const spread = Math.abs(1 - (yesPrice + noPrice));
+      // 如果找到了 YES/NO，使用它们
+      if (yesToken && noToken) {
+        const yesPrice = this.extractPrice(yesToken);
+        const noPrice = this.extractPrice(noToken);
+        const spread = Math.abs(1 - (yesPrice + noPrice));
+        
+        console.log(`[Market Parser] YES/NO market found: ${market.question}`);
+        
+        return {
+          marketId: market.condition_id || market.id || '',
+          question: market.question || 'Unknown',
+          yesPrice,
+          noPrice,
+          yesBestAsk: yesToken?.price?.bestAsk ? parseFloat(yesToken.price.bestAsk) : yesPrice,
+          noBestAsk: noToken?.price?.bestAsk ? parseFloat(noToken.price.bestAsk) : noPrice,
+          yesBestBid: yesToken?.price?.bestBid ? parseFloat(yesToken.price.bestBid) : yesPrice,
+          noBestBid: noToken?.price?.bestBid ? parseFloat(noToken.price.bestBid) : noPrice,
+          spread,
+          liquidity: parseFloat(market.volume || market.liquidity || '0') || 0,
+          status: market.closed ? 'SETTLED' : (market.active !== false ? 'ACTIVE' : 'INACTIVE'),
+          timestamp: Date.now(),
+        };
+      }
       
-      return {
-        marketId: market.condition_id || market.id || '',
-        question: market.question || 'Unknown',
-        yesPrice,
-        noPrice,
-        yesBestAsk: yesToken?.price?.bestAsk ? parseFloat(yesToken.price.bestAsk) : yesPrice,
-        noBestAsk: noToken?.price?.bestAsk ? parseFloat(noToken.price.bestAsk) : noPrice,
-        yesBestBid: yesToken?.price?.bestBid ? parseFloat(yesToken.price.bestBid) : yesPrice,
-        noBestBid: noToken?.price?.bestBid ? parseFloat(noToken.price.bestBid) : noPrice,
-        spread,
-        liquidity: parseFloat(market.volume || market.liquidity || '0') || 0,
-        status: market.closed ? 'SETTLED' : (market.active !== false ? 'ACTIVE' : 'INACTIVE'),
-        timestamp: Date.now(),
-      };
+      // 如果没有找到标准格式，使用前两个 token
+      if (tokens.length >= 2) {
+        const firstToken = tokens[0];
+        const secondToken = tokens[1];
+        
+        const firstPrice = this.extractPrice(firstToken);
+        const secondPrice = this.extractPrice(secondToken);
+        const spread = Math.abs(1 - (firstPrice + secondPrice));
+        
+        console.log(`[Market Parser] Using first two tokens: ${firstToken.outcome}, ${secondToken.outcome}`);
+        
+        return {
+          marketId: market.condition_id || market.id || '',
+          question: market.question || 'Unknown',
+          yesPrice: firstPrice,
+          noPrice: secondPrice,
+          yesBestAsk: firstToken?.price?.bestAsk ? parseFloat(firstToken.price.bestAsk) : firstPrice,
+          noBestAsk: secondToken?.price?.bestAsk ? parseFloat(secondToken.price.bestAsk) : secondPrice,
+          yesBestBid: firstToken?.price?.bestBid ? parseFloat(firstToken.price.bestBid) : firstPrice,
+          noBestBid: secondToken?.price?.bestBid ? parseFloat(secondToken.price.bestBid) : secondPrice,
+          spread,
+          liquidity: parseFloat(market.volume || market.liquidity || '0') || 0,
+          status: market.closed ? 'SETTLED' : (market.active !== false ? 'ACTIVE' : 'INACTIVE'),
+          timestamp: Date.now(),
+        };
+      }
+      
+      console.error('[Market Parser] No valid tokens found');
+      return null;
     } catch (error) {
       console.error('Failed to parse market:', error);
       return null;
@@ -344,7 +449,10 @@ export class PolymarketClient {
     if (typeof price === 'number') return price;
     if (typeof price === 'string') return parseFloat(price) || 0.5;
     if (typeof price === 'object') {
-      return parseFloat(price.price || price.bestAsk || price.bestBid || '0.5') || 0.5;
+      // 优先使用 bestAsk (买入价格)
+      if (price.bestAsk) return parseFloat(price.bestAsk) || 0.5;
+      if (price.price) return parseFloat(price.price) || 0.5;
+      if (price.bestBid) return parseFloat(price.bestBid) || 0.5;
     }
     
     return 0.5;

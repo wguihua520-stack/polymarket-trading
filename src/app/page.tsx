@@ -441,13 +441,13 @@ export default function Home() {
           </p>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 5 }}>
             <div>
-              <span style={{ fontSize: 12, color: '#666' }}>YES:</span>
+              <span style={{ fontSize: 12, color: '#666' }}>UP:</span>
               <span style={{ fontSize: 18, fontWeight: 'bold', marginLeft: 5, color: '#1976d2' }}>
                 {marketPrice.yes.toFixed(4)}
               </span>
             </div>
             <div>
-              <span style={{ fontSize: 12, color: '#666' }}>NO:</span>
+              <span style={{ fontSize: 12, color: '#666' }}>DOWN:</span>
               <span style={{ fontSize: 18, fontWeight: 'bold', marginLeft: 5, color: '#d32f2f' }}>
                 {marketPrice.no.toFixed(4)}
               </span>
@@ -566,7 +566,7 @@ export default function Home() {
       <div style={{ background: '#fff3e0', padding: 15, borderRadius: 10, marginTop: 15, borderLeft: '4px solid #ff9800' }}>
         <h4 style={{ margin: '0 0 8px 0', color: '#e65100', fontSize: 13 }}>策略说明</h4>
         <p style={{ margin: 0, fontSize: 12, color: '#bf360c' }}>
-          当检测到 YES/NO 价格在 3 秒内下跌 ≥15% 时，自动买入下跌侧（Leg1）。
+          当检测到 UP/DOWN 价格在 3 秒内下跌 ≥15% 时，自动买入下跌侧（Leg1）。
           当 Leg1 价格 + 另一侧价格 ≤ 0.93 时，买入另一侧（Leg2）完成对冲。
           理论利润 = 1 - 总价格 - 手续费。
         </p>

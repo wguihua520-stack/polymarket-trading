@@ -148,29 +148,42 @@ export class TradingEngine {
    */
   private async findMarketAndStartMainLoop(): Promise<void> {
     try {
-      const client = getPolymarketClient();
-      const response = await client.searchMarkets('bitcoin');
+      // 查找比特币15分钟市场
+      const btcResponse = await client.getBitcoin15MinMarket();
       
-      if (!response.success || !response.data || response.data.length === 0) {
-        this.log('WARN', 'ENGINE', '未找到比特币市场，使用默认市场');
-        this.currentMarketId = 'btc-15min-default';
-        this.currentMarketQuestion = '比特币15分钟涨跌预测';
+      if (btcResponse.success && btcResponse.data) {
+        this.currentMarketId = btcResponse.data.marketId;
+        this.currentMarketQuestion = btcResponse.data.question;
+        this.log('INFO', 'ENGINE', `已选择市场: ${btcResponse.data.question}`, {
+          UP价格: btcResponse.data.yesPrice.toFixed(4),
+          DOWN价格: btcResponse.data.noPrice.toFixed(4),
+          价差: `${(btcResponse.data.spread * 100).toFixed(2)}%`,
+        });
       } else {
-        // 筛选高流动性市场
-        const config = getConfig();
-        const suitableMarkets = response.data.filter(market => 
-          market.spread < config.maxSpread && 
-          market.status === 'ACTIVE'
-        );
+        // 尝试搜索市场
+        const response = await client.searchMarkets('bitcoin');
         
-        if (suitableMarkets.length > 0) {
-          const market = suitableMarkets[0];
-          this.currentMarketId = market.marketId;
-          this.currentMarketQuestion = market.question;
-          this.log('INFO', 'ENGINE', `已选择市场: ${market.question}`);
+        if (!response.success || !response.data || response.data.length === 0) {
+          this.log('WARN', 'ENGINE', '未找到比特币市场，使用默认市场');
+          this.currentMarketId = 'btc-15min-default';
+          this.currentMarketQuestion = '比特币15分钟涨跌预测';
         } else {
-          this.currentMarketId = response.data[0].marketId;
-          this.currentMarketQuestion = response.data[0].question;
+          // 筛选高流动性市场
+          const config = getConfig();
+          const suitableMarkets = response.data.filter(market => 
+            market.spread < config.maxSpread && 
+            market.status === 'ACTIVE'
+          );
+          
+          if (suitableMarkets.length > 0) {
+            const market = suitableMarkets[0];
+            this.currentMarketId = market.marketId;
+            this.currentMarketQuestion = market.question;
+            this.log('INFO', 'ENGINE', `已选择市场: ${market.question}`);
+          } else {
+            this.currentMarketId = response.data[0].marketId;
+            this.currentMarketQuestion = response.data[0].question;
+          }
         }
       }
       
