@@ -56,65 +56,29 @@ export class PolymarketClient {
         }
       }
       
-      // 从 Gamma API 获取最新的比特币15分钟市场
-      const response = await fetch(
-        'https://gamma-api.polymarket.com/markets?limit=20&closed=false&active=true',
-        {
-          method: 'GET',
-          headers: {
-            'Accept': 'application/json',
-          },
-          cache: 'no-store',
-        }
-      );
+      // 方法1: 通过 slug 直接查询比特币15分钟市场
+      console.log('[Market] Method 1: Querying by slug btc-15m-change...');
+      let btcMarket = await this.fetchMarketBySlug('btc-15m-change');
       
-      if (!response.ok) {
-        throw new Error(`Gamma API error: ${response.status}`);
+      // 方法2: 如果没找到，尝试其他 slug
+      if (!btcMarket) {
+        console.log('[Market] Method 2: Querying by slug btc-15min...');
+        btcMarket = await this.fetchMarketBySlug('btc-15min');
       }
       
-      const markets = await response.json();
-      
-      console.log(`[Market] Found ${markets.length} markets from Gamma API`);
-      
-      // 打印所有市场名称（调试用）
-      markets.forEach((m: any, i: number) => {
-        console.log(`[Market ${i}] ${m.question}`);
-      });
-      
-      // 找到比特币15分钟市场（UP/DOWN 格式）- 放宽条件
-      let btcMarket = markets.find((m: any) => {
-        const question = m.question?.toLowerCase() || '';
-        return (
-          (question.includes('bitcoin') || question.includes('btc')) &&
-          question.includes('15') &&
-          (question.includes('up') || question.includes('down'))
-        );
-      });
-      
-      // 如果没找到，尝试更宽松的条件
+      // 方法3: 搜索包含 "bitcoin" 和 "up or down" 的市场
       if (!btcMarket) {
-        console.log('[Market] No exact match, trying broader search...');
-        btcMarket = markets.find((m: any) => {
-          const question = m.question?.toLowerCase() || '';
-          return (
-            (question.includes('bitcoin') || question.includes('btc')) &&
-            (question.includes('up') || question.includes('down') || 
-             question.includes('涨') || question.includes('跌'))
-          );
-        });
+        console.log('[Market] Method 3: Searching for Bitcoin Up or Down...');
+        btcMarket = await this.searchBitcoinMarket();
       }
       
-      // 如果还是没找到，尝试任何比特币市场
+      // 方法4: 如果还是没找到，查询更多市场
       if (!btcMarket) {
-        console.log('[Market] Still no match, trying any Bitcoin market...');
-        btcMarket = markets.find((m: any) => {
-          const question = m.question?.toLowerCase() || '';
-          return question.includes('bitcoin') || question.includes('btc');
-        });
+        console.log('[Market] Method 4: Querying more markets (limit=100)...');
+        btcMarket = await this.fetchMoreMarkets();
       }
       
       if (!btcMarket) {
-        console.error('[Market] No Bitcoin market found in API response');
         throw new Error('No active Bitcoin 15min market found');
       }
       
@@ -183,6 +147,130 @@ export class PolymarketClient {
         success: false, 
         error: error instanceof Error ? error.message : 'Unknown error' 
       };
+    }
+  }
+  
+  /**
+   * 通过 slug 查询市场
+   */
+  private async fetchMarketBySlug(slug: string): Promise<any | null> {
+    try {
+      const response = await fetch(
+        `https://gamma-api.polymarket.com/markets?slug=${slug}&closed=false`,
+        {
+          method: 'GET',
+          headers: { 'Accept': 'application/json' },
+          cache: 'no-store',
+        }
+      );
+      
+      if (!response.ok) return null;
+      
+      const data = await response.json();
+      const market = Array.isArray(data) ? data[0] : data;
+      
+      if (market && market.tokens) {
+        console.log(`[Market] Found by slug: ${market.question}`);
+        return market;
+      }
+      
+      return null;
+    } catch (error) {
+      console.error(`[Market] Slug query failed: ${slug}`, error);
+      return null;
+    }
+  }
+  
+  /**
+   * 搜索比特币 Up or Down 市场
+   */
+  private async searchBitcoinMarket(): Promise<any | null> {
+    try {
+      const response = await fetch(
+        'https://gamma-api.polymarket.com/markets?limit=100&closed=false&active=true',
+        {
+          method: 'GET',
+          headers: { 'Accept': 'application/json' },
+          cache: 'no-store',
+        }
+      );
+      
+      if (!response.ok) return null;
+      
+      const markets = await response.json();
+      
+      // 查找 "Bitcoin Up or Down" 或包含 "15 Minutes" 的市场
+      const btcMarket = markets.find((m: any) => {
+        const question = m.question?.toLowerCase() || '';
+        return (
+          (question.includes('bitcoin') || question.includes('btc')) &&
+          (question.includes('up or down') || 
+           question.includes('up/down') ||
+           question.includes('15 min') ||
+           question.includes('15-minute') ||
+           question.includes('minutes'))
+        );
+      });
+      
+      if (btcMarket) {
+        console.log(`[Market] Found by search: ${btcMarket.question}`);
+        return btcMarket;
+      }
+      
+      return null;
+    } catch (error) {
+      console.error('[Market] Search failed:', error);
+      return null;
+    }
+  }
+  
+  /**
+   * 查询更多市场（最后手段）
+   */
+  private async fetchMoreMarkets(): Promise<any | null> {
+    try {
+      const response = await fetch(
+        'https://gamma-api.polymarket.com/markets?limit=200&closed=false&active=true',
+        {
+          method: 'GET',
+          headers: { 'Accept': 'application/json' },
+          cache: 'no-store',
+        }
+      );
+      
+      if (!response.ok) return null;
+      
+      const markets = await response.json();
+      
+      console.log(`[Market] Fetched ${markets.length} markets`);
+      
+      // 打印前 50 个市场名称用于调试
+      markets.slice(0, 50).forEach((m: any, i: number) => {
+        console.log(`[Market ${i}] ${m.question}`);
+      });
+      
+      // 查找比特币相关的短期市场
+      const btcMarket = markets.find((m: any) => {
+        const question = m.question?.toLowerCase() || '';
+        const hasBitcoin = question.includes('bitcoin') || question.includes('btc');
+        const isShortTerm = 
+          question.includes('15') ||
+          question.includes('minute') ||
+          question.includes('min') ||
+          question.includes('up') ||
+          question.includes('down');
+        return hasBitcoin && isShortTerm;
+      });
+      
+      if (btcMarket) {
+        console.log(`[Market] Found in extended search: ${btcMarket.question}`);
+        return btcMarket;
+      }
+      
+      return null;
+    } catch (error) {
+      console.error('[Market] Extended search failed:', error);
+      return null;
     }
   }
   
